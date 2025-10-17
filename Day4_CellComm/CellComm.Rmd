@@ -1,0 +1,553 @@
+---
+title: "Gene set analysis and Cell-cell communication"
+output: html_notebook
+---
+
+# Introduction
+
+The goal of this notebook is to show different ways of combining informative gene sets with scRNA-seq data. Gene set analysis has been a staple of transcriptomics, and can be used now with cell type resolution. Furthermore, methods for cell-cell communication inference allow for the discovery of pairs of cell types establishing potentially relevant contacts in various conditions.
+
+These methods can be extended depending on the source references used. One is able to look for drugs affecting the expressed genes, or genetically-associated phenotypes from GWAS variants.
+
+For this notebook there are some relevant references:
+
+ - The paper with the example source data is: https://www.sciencedirect.com/science/article/pii/S0092867420306723
+ - the associated data: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE144240
+ - another introductionto cell-cell communication in python can be see here: https://www.sc-best-practices.org/mechanisms/cell_cell_communication.html
+ - LIANA will be the main package used for CCC: https://www.nature.com/articles/s41467-022-30755-0; https://www.nature.com/articles/s41556-024-01469-w; https://saezlab.github.io/liana/ 
+
+The source data compares cells from normal skin samples vs those with a tumour. For simplicity, we will only be using data from one of the patients.
+
+Cell type nomenclature for the example data:
+ - LC: Langerhans cells (skin-resident macrophages/dendritic cells)
+ - KC: Keratinocytes
+ - Mig: Migrating
+ - PDC: plasmacytoid Dendritic cells
+ - NK: Natural Killer cells
+ - Treg: T regulatory cells
+ - ASDC: AXL+SIGLEC6+ (AS) dendritic cells
+ - CD1C: conventional Dendritic cells type 2 (cDC2) 
+ - CLEC9A: conventional Dendritic cells type 1 (cDC1) 
+ - Mac: Macrophages
+ - MDSC: myeloid-derived suppressor cells
+ - TSK: Tumor-specific keratinocytes
+ - CD4: T-helper cells
+ - CD8: Cytotoxic T cells
+ - Exh: Exhausted
+ - EM: Effector Memory
+ - EMRA: T cells re-expressing CD45RA
+
+
+
+# Setup
+Load libraries
+
+```{r}
+library(dplyr) # data wranggling
+library(ggplot2) # plotting
+
+library(igraph) # for networks
+library(pheatmap) # for simple heatmaps
+
+#devtools::install_github("immunogenomics/presto")
+library(presto) # fast DE
+library(gprofiler2) # gene set enrichment
+
+library(Seurat) # scRNA.seq data analysis
+#remotes::install_github('saezlab/liana')
+library(liana) # cell-cell communication
+# install.packages("furrr") # if you'd like to parallelize Cell Comm analysis
+```
+
+
+
+# Preparing the data
+Load data
+
+```{r}
+srat = readRDS("../data/P9_srat.RDS")
+```
+
+This will briefly recap what you learned in the introduction class.  
+Normalise and scale data
+
+```{r}
+srat = NormalizeData(srat, normalization.method = "LogNormalize", scale.factor = 10000)
+srat = ScaleData(srat, features = rownames(srat))
+```
+
+Run PCA
+
+```{r}
+srat = RunPCA(srat, features = rownames(srat))
+# Visualize PCA elbow plot to determine significant PCs
+ElbowPlot(srat, ndims = 50)
+```
+
+Generate UMAP and visualise annotated cell types
+(in this situation, we do not perform integration between Tumour and Normal since cell types are already identified and we only wish to get an overview of the dataset)
+
+```{r, fig.height=10, fig.width=12}
+srat = RunUMAP(srat, dims = 1:30, verbose = F)
+# Visualize UMAP
+DimPlot(srat, reduction = "umap", group.by = "tum.norm", label = T)
+DimPlot(srat, reduction = "umap", group.by = "level1_celltype", label = T)
+DimPlot(srat, reduction = "umap", group.by = "level2_celltype", label = T)
+DimPlot(srat, reduction = "umap", group.by = "level3_celltype", label = T)
+```
+
+Simplifying some cell type labels
+
+```{r}
+srat$level2_celltype = gsub("Tumor_", "", srat$level2_celltype)
+srat$level2_celltype = gsub("Normal_", "", srat$level2_celltype)
+srat$level3_celltype = gsub("Tumor_", "", srat$level3_celltype)
+srat$level3_celltype = gsub("Normal_", "", srat$level3_celltype)
+
+DimPlot(srat, reduction = "umap", group.by = "level2_celltype", label = T)
+DimPlot(srat, reduction = "umap", group.by = "level3_celltype", label = T)
+```
+
+
+
+# Gene modules
+Scoring groups of genes can be useful to identify specific cell functions and phenotypes.  
+
+
+## Cell cycle scoring
+One of the most commonly uses for scoring is the detection of cells undergoing replication. In Seurat, this is usually done by running the "CellCycleScoring" function, which uses pre-prepared gene sets for the S and G2M cell cycle phases.  
+
+```{r}
+srat = CellCycleScoring(srat, 
+                        s.features = cc.genes$s.genes, 
+                        g2m.features = cc.genes$g2m.genes, 
+                        set.ident = F, nbin = 20)
+```
+
+The infered cell cycle phase can be visualised in the UMAP plot
+
+```{r}
+DimPlot(srat, reduction = "umap", group.by = "Phase")
+```
+
+And the individual scores as violin plots
+
+```{r, fig.height=7, fig.width=10}
+VlnPlot(srat, features = c("S.Score", "G2M.Score"), group.by = "level2_celltype", ncol = 1)
+```
+
+
+
+## Gene modules
+More generally, gene modules can be calculated for each cell using the "AddModuleScore" function. This function compares the average expression of the genes in a given module with average expression of bins of control genes, resulting in a score reflecting how much more represented the target module is.  
+
+There are several gene module databases available (GO Terms, KEGG, ...), and you are also welcome to build your own based on literature knowledge from the system you're studying. Here we will be using the Epithelial-to-Mesenchymal Transition Hallmark gene set from the GSEA MSigDB website. The goal will be to recapitulate the results shown on Figure 2G of the source manuscript.
+
+https://www.gsea-msigdb.org/gsea/msigdb/human/collection_details.jsp#H
+https://www.gsea-msigdb.org/gsea/msigdb/human/genesets.jsp?collection=H
+https://www.gsea-msigdb.org/gsea/msigdb/cards/HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION.html
+
+Read in the gene set
+
+```{r}
+HM_EMT = read.table("../data/HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION.v2025.1.Hs.tsv", sep = "\t")
+HM_EMT_g = strsplit(HM_EMT[18,2], split = ",")[[1]]
+```
+
+Add the gene set scores to the metadata. This is added as a list, where each element will be a set. The name argument will be the prefix of the column, followed by the index of the gene set in the list. In the example below, the column will be called "HM_EMT1".
+
+```{r}
+srat = AddModuleScore(srat, features = list(HM_EMT_g), name = "HM_EMT")
+```
+
+Now that the gene set has been calculated, create a Violin Plot to show it for each cell type. Take into consideration that you have two conditions, and thus you also want to see the data split by them.,
+
+```{r}
+
+```
+
+To get to a closer recapitulation of the source figure, select only identity of the cell types of interest. Bear in mind that, unlike the paper, we are only using one donor, so results will not be an exact match.
+
+```{r}
+# you may need to change the Idents of the object!
+```
+
+We can then test for differences between populations. While this is the same test performed in manuscript (albeit in a single patient), when the full dataset is available the pseudobulked scores per patient can be used for a more individual-controlled analysis
+
+```{r}
+tsk_score = srat$HM_EMT1[srat$level3_celltype=="TSK"]
+nontsk_score = srat$HM_EMT1[srat$level3_celltype!="TSK"]
+
+wilcox.test(tsk_score, nontsk_score)
+```
+
+
+## Gene set enrichment
+Instead of a directed search for a known set of genes, we can also search for any enriched gene set. In Figure 2E, we can see some enriched pathways in the DE genes between Normal and Tumour samples for some cell types. 
+
+Start by finding the DE genes between TSK and KC Basal cells, to recapitulate the third column in the figure.
+
+```{r}
+# mk_clusters = 
+```
+
+We can now extract the DE genes to determine enriched Biological Process GO Terms. These are the most widely used gene sets, reflecting various annotated cell functions based on literature and electronic inference from associated genes. Here we'll be using the "gost" function from the "gprofiler2" package, which calls the online tool with the same name to perform the test.
+
+Gene set enrichment can usually be performed in two ways. The first is by using a Fisher's/Hypergeometric test for enrichment, to check if a genes from a given gene set are more present/depleted in the target gene group than expected. However, we can also take into account the ordering of genes by performing a Gene Set Enrichment Analysis (GSEA), where the ranking or scores of genes are taken into account. This means that enriched gene sets will have their genes, for example, at the top of a list of DE genes, rather than just spread out over it.
+
+```{r}
+allgenes = rownames(srat) # all genes, to serve as background
+
+# genes upregulated in TSK (vs Normal Basal cells)
+degenes = mk_clusters %>%
+  filter(p_val_adj<=0.05 & avg_log2FC>0.5) %>%
+  arrange(-avg_log2FC) #%>% # top genes
+  #slice_head(n = 200)
+
+gprof_up = gost(rownames(degenes), ordered_query = T, 
+                custom_bg = allgenes, # always set a custom bg!
+                sources = "GO:BP", 
+                correction_method = "g_SCS", # more stringent than FDR, 
+                ##considers hierarchical structure of GO Terms (see https://biit.cs.ut.ee/gprofiler/page/docs)
+                organism = "hsapiens", user_threshold = 0.05)
+
+# genes downregulated in TSK (vs Normal Basal cells)
+degenes = mk_clusters %>%
+  filter(p_val_adj<=0.05 & avg_log2FC<(-0.5)) %>%
+  arrange(avg_log2FC) #%>% # bottom genes
+  #slice_head(n = 200)
+
+gprof_dn = gost(rownames(degenes), ordered_query = T, 
+                custom_bg = allgenes, # always set a custom bg!
+                sources = "GO:BP", 
+                correction_method = "g_SCS", # more stringent than FDR, 
+                ##considers hierarchical structure of GO Terms (see https://biit.cs.ut.ee/gprofiler/page/docs)
+                organism = "hsapiens", user_threshold = 0.05)
+
+# View(gprof_up$result)
+```
+
+This function will show all gene sets enriched in an interactive plot
+
+```{r}
+gostplot(gprof_up)
+```
+
+To partially recapitulate the original figure (since results don't compeltely match due to differences in the data and method used), we can plot ourselves the enrichment of specific gene sets
+
+```{r}
+terms_use = c("extracellular structure organization", "extracellular matrix organization", 
+              "cell adhesion", "cell migration", 
+              "tissue development", "cell cycle")
+plot_df = gprof_up$result[gprof_up$result$term_name %in% terms_use,]
+ggplot(plot_df, aes(x = "TSK", y = term_name, 
+                            size = -log10(p_value), fill = intersection_size))+
+  geom_point(shape = 21)+
+  labs(fill = "# genes")+
+  theme_bw()
+```
+
+
+
+# Cell-cell Communication
+## Prepare data
+For cell-cell communication analysis, we first need to go back to the original datasets and split it between Normal and Tumour
+
+```{r}
+# use the variable sin the meta data to create two seurat objects
+#srat_n = 
+#srat_t = 
+```
+
+Further, we need to filter it to avoid including cell types that may have little signifficance for out analysis
+
+```{r}
+# Examine the cell type labels carefully. Should all be included for downstream analyses? 
+## Consider both the label and the abundance in each condition
+```
+
+
+## Running cell-cell communication inference
+In this notebook, we'll be using the LIANA package, which implements various methods of cell-cell communication inference
+
+```{r}
+liana::show_methods()
+```
+
+Different methods also use different resources, which may differ in the way they are collected and curated. LIANA allows the user to combine different methods and gene lists
+
+```{r}
+liana::show_resources()
+```
+
+Here we'll be running CellPhoneDB through LIANA. Run for each dataset (will take a few minutes for each!)
+
+```{r}
+liana_n = liana_wrap(srat_n, idents_col = "level3_celltype", 
+                     method = "cellphonedb", resource = c('CellPhoneDB'),
+                     permutation.params = list(nperms=1000, parallelize=T, workers=4)) # you may need to adjust these depending on your computer
+liana_t = liana_wrap(srat_t, idents_col = "level3_celltype", 
+                     method = "cellphonedb", resource = c('CellPhoneDB'),
+                     permutation.params = list(nperms=1000, parallelize=T, workers=4)) # you may need to adjust these depending on your computer
+```
+
+Results structure
+
+```{r}
+dim(liana_t)
+head(liana_t)
+```
+
+This is a very large matrix. But results can be filtered to focus on more relevant interactions. 
+
+Different methods provide different metrics. In the case of CellPhoneDB, we mostly care about the pvalue of the interaction and the lr.mean, signiffying the average expression of ligand and receptor across pairs of cell types.
+
+```{r}
+# which parameters can you use for filtering?
+```
+
+
+## Plotting CCC results
+LIANA provides a few functions to explore these results. The simplest exploration in counting interactions per pair of cell type
+
+```{r, fig.height=7, fig.width=7.5}
+heat_freq(liana_n_filt, grid_text = T, font_size = 10)
+heat_freq(liana_t_filt, grid_text = T, font_size = 10)
+```
+
+What are the top ligands/receptors and sending/receiving cell types?
+
+```{r}
+head(sort(table(liana_t_filt$ligand), decreasing = T))
+head(sort(table(liana_t_filt$receptor), decreasing = T))
+
+head(sort(table(liana_t_filt$source), decreasing = T))
+head(sort(table(liana_t_filt$target), decreasing = T))
+```
+
+We can also plot specific interactions. In this example, we're using LIANA's internal dotplot function to show the top 20 interactions of a specific set of cell types (partially related to the paper's Figure 4F)
+
+```{r, fig.width=20, fig.height=10}
+liana_t_filt %>%
+  liana_dotplot(source_groups = c("Mac", "Mig_LC", "Mig_CLEC9A", "CLEC9A"),
+                target_groups = c("B Cell", "Mig_CD1C", "CD4_Naive"),
+                magnitude = "lr.mean",
+                specificity = "receptor.prop",
+                ntop = 20)
+```
+
+We can also assess the amount of interactions involving each pair of cell types with a chordplot.
+*How does it change when you change the number of cell types?*
+
+```{r}
+p <- chord_freq(liana_t_filt, 
+                source_groups = c("Mac", "Mig_LC", "Mig_CLEC9A", "CLEC9A"),
+                target_groups = c("B Cell", "Mig_CD1C", "CD4_Naive"), cex = 1, facing = "downward")
+```
+
+
+## Further exploration and interpretation
+There are several types of interactions. Interpreting the data will depend on examining these types. We can filter interactions by their type, fetching this information from the OminPath database
+
+```{r}
+pm_omni = generate_omni(loc_consensus_percentile = 51, consensus_percentile = NULL,
+                        min_curation_effort = 1, ligrecextra = FALSE, remove_complexes = FALSE,
+                        simplify = TRUE)
+```
+
+Now we add interaction annotation to inference results
+
+```{r}
+liana_n_ann = merge(liana_n_filt, pm_omni[,c(3,4,16,17)], 
+                    by.x = c("ligand.complex","receptor.complex"), 
+                    by.y = c("source_genesymbol","target_genesymbol"), all.x = T)
+liana_n_ann = liana_n_ann[,c(colnames(liana_n), "category_intercell_source","category_intercell_target")]
+
+liana_t_ann = merge(liana_t_filt, pm_omni[,c(3,4,16,17)], 
+                    by.x = c("ligand.complex","receptor.complex"), 
+                    by.y = c("source_genesymbol","target_genesymbol"), all.x = T)
+liana_t_ann = liana_t_ann[,c(colnames(liana_t), "category_intercell_source","category_intercell_target")]
+```
+
+Plot the number of interactions of a given type
+
+```{r}
+# looking only at interaction source
+ligand_type = "ecm"
+
+# filter each result matrix
+plot_df1 = data.frame(table(liana_n_ann$source[liana_n_ann$category_intercell_source==ligand_type]))
+plot_df1$cond = "Normal"
+plot_df2 = data.frame(table(liana_t_ann$source[liana_t_ann$category_intercell_source==ligand_type]))
+plot_df2$cond = "Tumor"
+
+# prepare data for plotting
+plot_df = rbind(plot_df1, plot_df2)
+plot_df$Var1 = factor(plot_df$Var1, levels = unique(plot_df$Var1[order(plot_df$Freq, decreasing = F)]))
+
+ggplot(plot_df, aes(x = Freq, y = Var1, group = cond, fill = cond))+
+  geom_col(position = "dodge")+
+  theme_bw()
+```
+
+When analysing two conditions, we can compare them in various ways. One is to compare the number of interactions established by each cell type.
+
+Note that in these matrices, the rows represent *sender* cell types, and columns represent *receiver* cell types, meaning the matrix is directional (and thus will not look symmetric)
+
+```{r, fig.height=5, fig.width=6}
+mat_n = table(liana_n_filt$source, liana_n_filt$target)
+mat_t = table(liana_t_filt$source, liana_t_filt$target)
+
+c_ct = intersect(colnames(mat_n), colnames(mat_t))
+mat_diff = mat_t[c_ct,c_ct]-mat_n[c_ct,c_ct]
+
+# making a colour scale centred on 0 with equal intensities based on values
+col = colorRampPalette(c("blue", "white", "red"))(100)
+values = seq(min(mat_diff), max(mat_diff), length.out = 100)
+## normalise values so that 0 is the midpoint and the extremes are symmetric
+max_abs = max(abs(values))
+normalized_values = values/max_abs
+## map to colors
+color_indices = pmin(pmax(round((normalized_values + 1)*50), 1), 100)
+colors = col[color_indices]
+
+pheatmap::pheatmap(mat_diff, display_numbers = T, 
+                   clustering_method = "ward.D2",
+                   color = colors, number_format = "%.0f",
+                   treeheight_row = 10, treeheight_col = 10)
+```
+
+Matrices can be seen as representations of interaction networks. We can thus plot this data in the hairballs you all know, to showcase different aspects of the data.
+
+In this case, both sending and receiving edges will be similarly shown.
+
+```{r}
+# networks are usually prepared/analysed with the igraph package
+network_cond = graph_from_adjacency_matrix(mat_t, weighted=T, mode="directed", diag=F)
+# prepare the nodes
+set.seed(1) # the nice layout has an element of randomness
+l_cond = data.frame(igraph::layout_nicely(network_cond))
+rownames(l_cond) = colnames(mat_t)
+l_cond$total = rowSums(mat_t)
+l_cond$name = rownames(l_cond)
+
+# prepare the edges
+edge_df = data.frame(mat_t)
+edge_df = merge(edge_df, l_cond[,1:2], by.x = 2, by.y = 0)
+edge_df = merge(edge_df, l_cond[,1:2], by.x = 2, by.y = 0)[,c(1,2,3,6,7,4,5)]
+colnames(edge_df)[4:7] = c("x1", "y1", "x2", "y2")
+
+pltboth = ggplot()+
+  geom_segment(data = edge_df, 
+               mapping = aes(x = x1, xend = x2, y = y1, yend = y2, linewidth = Freq), 
+               show.legend = F, alpha = 0.2)+
+  geom_label(data = l_cond, mapping = aes(x = X1, y = X2, label = name, 
+                                          fill = total), 
+             show.legend = F, size = 3,colour = "white")+
+  scale_linewidth_continuous(range = c(0, 3), limits = range(edge_df$Freq))+
+  theme_classic()
+print(pltboth)
+```
+
+And we can more explicitly check which cell types are more senders or receivers of signals
+
+```{r}
+# still just using tumour interactions
+diff_t = t(mat_t)-mat_t # the difference between the transposed and normal matrix will show the difference betwee sending and receiving interactions for each pair
+network_cond = graph_from_adjacency_matrix(diff_t, weighted=T, mode="undirected", diag=F)
+set.seed(1)
+l_cond = data.frame(igraph::layout_nicely(network_cond))
+rownames(l_cond) = colnames(diff_t)
+l_cond$total = rowSums(diff_t)
+l_cond$name = rownames(l_cond)
+
+edge_df = data.frame(diff_t)
+edge_df = merge(edge_df, l_cond[,1:2], by.x = 2, by.y = 0)
+edge_df = merge(edge_df, l_cond[,1:2], by.x = 2, by.y = 0)[,c(1,2,3,6,7,4,5)]
+colnames(edge_df)[4:7] = c("x1", "y1", "x2", "y2")
+edge_df$dir = edge_df$Freq>0
+edge_df = edge_df[edge_df$Freq!=0,]
+
+pltboth = ggplot()+
+  geom_segment(data = edge_df, 
+               mapping = aes(x = x1, xend = x2, y = y1, yend = y2, 
+                             # note the absolute value
+                             ## we want the scale to reflect how different the number of interactions are!
+                             linewidth = abs(Freq), colour = dir), 
+               show.legend = F, alpha = 0.2)+
+  geom_point(data = l_cond, mapping = aes(x = X1, y = X2, fill = total), 
+             show.legend = F, shape = 21, colour = "grey90", size = 6)+
+  geom_label(data = l_cond, mapping = aes(x = X1, y = X2, label = name, 
+                                          fill = total), 
+             show.legend = F, size = 3,colour = "white")+
+  scale_linewidth_continuous(range = c(0, 3), limits = range(edge_df$Freq))+
+  scale_colour_manual(values = c("blue", "red"))+
+  scale_fill_gradient2(midpoint = 0, mid = "grey80", 
+                       low = "blue", high = "red",transform = "reverse")+
+  theme_classic()
+print(pltboth)
+```
+
+Similarly, we can check how the networks differ by condition. In this example we're only considering one of the directions for the interactions
+
+```{r}
+liana_n_filt2 = liana_n_filt
+liana_t_filt2 = liana_t_filt
+# consider all cell types (not all are present in both conditions)
+liana_n_filt2$source = factor(liana_n_filt2$source, 
+                             levels = unique(c(liana_n_filt$source, liana_t_filt$source)))
+liana_t_filt2$source = factor(liana_t_filt2$source, 
+                             levels = unique(c(liana_n_filt$source, liana_t_filt$source)))
+liana_n_filt2$target = factor(liana_n_filt2$target, 
+                             levels = unique(c(liana_n_filt$target, liana_t_filt$target)))
+liana_t_filt2$target = factor(liana_t_filt2$target, 
+                             levels = unique(c(liana_n_filt$target, liana_t_filt$target)))
+## count interactions per condition
+mat_n = table(liana_n_filt2$source, liana_n_filt2$target)
+mat_t = table(liana_t_filt2$source, liana_t_filt2$target)
+## difference
+mat_diff = mat_t-mat_n
+
+network_cond = graph_from_adjacency_matrix(mat_diff, weighted=T, mode="directed", diag=F)
+set.seed(1)
+l_cond = data.frame(igraph::layout_nicely(network_cond))
+rownames(l_cond) = colnames(mat_diff)
+l_cond$total = rowSums(mat_diff)
+l_cond$name = rownames(l_cond)
+
+edge_df = data.frame(mat_diff)
+edge_df = merge(edge_df, l_cond[,1:2], by.x = 2, by.y = 0)
+edge_df = merge(edge_df, l_cond[,1:2], by.x = 2, by.y = 0)[,c(1,2,3,6,7,4,5)]
+colnames(edge_df)[4:7] = c("x1", "y1", "x2", "y2")
+edge_df$dir = edge_df$Freq>0
+
+pltboth = ggplot()+
+  geom_segment(data = edge_df, 
+               mapping = aes(x = x1, xend = x2, y = y1, yend = y2, 
+                             # note the absolute value
+                             ## we want the scale to reflect how different the number of interactions are!
+                             linewidth = abs(Freq), colour = dir), 
+               show.legend = F, alpha = 0.2)+
+  geom_point(data = l_cond, mapping = aes(x = X1, y = X2, fill = total), 
+             show.legend = F, shape = 21, colour = "grey90", size = 6)+
+  geom_label(data = l_cond, mapping = aes(x = X1, y = X2, label = name, 
+                                          fill = total), 
+             show.legend = F, size = 3,colour = "white")+
+  scale_linewidth_continuous(range = c(0, 3), limits = range(edge_df$Freq))+
+  scale_colour_manual(values = c("blue", "red"))+
+  scale_fill_gradient2(midpoint = 0, transform = "reverse")+
+  theme_classic()
+print(pltboth)
+```
+
+As you can see this results on a huge hairball. You can think of ways to filter the data and reveal more relevant cell type interactions
+
+```{r}
+
+```
+
+
+
+
+
+
