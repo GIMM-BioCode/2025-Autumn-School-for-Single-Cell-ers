@@ -6,7 +6,7 @@ Each day will be carried by one trainer and you will be able to find the materia
 
 ## Day 1 - Fundamentals of scRNA-seq 
 **_Instructor:_** Miguel Santos, Gulbenkian Institute for Molecular Medicine\
-You’ll be introduced to single-cell RNA sequencing (scRNA-seq) technology, covering the key principles and workflows involved in processing raw sequencing data into count matrices. We’ll also guide you through setting up your working environment for the week.
+You’ll be introduced to single-cell RNA sequencing (scRNA-seq) technology, covering the key principles and workflows involved in processing raw sequencing data into count matrices, and downstream analysis for the identification of cell types. We’ll also guide you through setting up your working environment for the week.
 
 At the end of the day, we will have a dedicated session for group formation and dataset preparation. During this time, you will choose a dataset to work on throughout the week.
 
