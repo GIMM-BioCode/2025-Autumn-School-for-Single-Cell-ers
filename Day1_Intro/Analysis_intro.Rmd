@@ -1,0 +1,486 @@
+---
+title: "Introduction to single-cell RNA-seq analysis"
+output: html_notebook
+---
+
+The aim of this notebook is to demonstrate how to use the Seurat R package to process scRNA-seq data.
+
+More on basic analysis with Seurat in <https://satijalab.org/seurat/articles/pbmc3k_tutorial.html>.
+
+See also <https://github.com/quadbiolab/scRNAseq_analysis_vignette/blob/master/Tutorial.md> for a more in-depth tutorial.
+
+
+# General setup
+Load necessary libraries
+
+Note, tutorial with seurat V5, which is substantially different from earlier version.
+<https://satijalab.org/seurat/articles/announcements.html>
+
+The download of version 5 or above should happen automatically. If you have worked with previous versions, download v5 or above following <https://satijalab.org/seurat/articles/install.html>
+
+```{r}
+# Bioconductor package installer
+if(!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+packages_use = c("Seurat", # package with conveniently organised scRNA-seq methods
+                 "clustree", # a method to help choose clustering resolution
+                 "dplyr",  # important to work with some data structures in R
+                 "ggplot2", # plotting
+                 "patchwork", # assembling plots
+                 "cowplot", # assembling plots
+                 "gplots") # also plotting)
+
+
+# for each package listed: if not installed, install, otherwise load it
+for(p in packages_use){
+  if(!(p %in% rownames(installed.packages()))){
+    BiocManager::install(p)
+    library(p, character.only = T)
+  } else{
+    library(p, character.only = T)
+  }
+}
+
+# set seed for randomisation (e.g. UMAP dimension reduction)
+set.seed(123)
+```
+
+
+
+# Load data
+Load your dataset.
+For this tutorial, we will use a dataset of 1k Peripheral blood mononuclear cells (PBMCs) from a healthy donor from 10x Genomics. 
+<https://www.10xgenomics.com/datasets/1-k-pbm-cs-from-a-healthy-donor-v-3-chemistry-3-standard-3-0-0>
+
+To read the data, we will use a dedicated function that reads cellranger outputs. In this case, we will read the filtered matrix.
+
+The **Read10X()** function reads in the output of the cellranger pipeline from 10X, returning a unique molecular identified (UMI) count matrix. The values in this matrix represent the number of molecules for each feature (i.e. gene; row) that are detected in each cell (column). Note that more recent versions of cellranger now also output using the h5 file format, which can be read in using the Read10X_h5() function in Seurat.
+
+```{r}
+PBMC_data = Read10X(data.dir = "/Users/miguel/Documents/scRNAseq course/2025/filtered_feature_bc_matrix_1k/")
+
+#PBMC_data = Read10X(data.dir = "ADD_DATASET_PATH")
+
+```
+
+This imports the matrix of counts into a objects of class dgCMatrix.
+Lets examine a few genes in the first thirty cells
+```{r}
+PBMC_data[c("CD3D", "TCL1A", "MS4A1"), 1:30]
+```
+The . values in the matrix represent 0s (no molecules detected). Since most values in an scRNA-seq matrix are 0, Seurat uses a sparse-matrix representation whenever possible. This results in significant memory and speed savings for Drop-seq/inDrop/10x data.
+
+
+We can use these to make a Seurat object, which is what we will use in the analysis:
+```{r}
+srat <- CreateSeuratObject(counts = PBMC_data, project = "PBMC_10x")
+```
+
+# Basic Seurat object structure
+
+There are two important components of the Seurat object to be aware of:
+
+The **@meta.data** slot, which stores metadata for our droplets/cells (e.g. which batch of samples they belong to, total counts, total number of detected genes, etc.).
+
+The **@assays slot**, which stores the matrix of raw counts, as well as (further down) matrices of normalised/transformed data.
+
+Starting with our metadata slot:
+```{r}
+head(srat@meta.data)
+```
+The rownames of this table represent the droplet/cell ids, given in the rownames of this table. The “orig.ident” has the sample names we  specified earlier. And we can see that Seurat automatically calculated total UMI counts (nCount_RNA) and the total number of detected genes (nFeature_RNA) in each droplet.
+The meta.data contains information for each cell on key measurements (number of UMI, number of genes, ..), experimental variables (batch, condition, ...), or output labels (clusters)
+
+We can also look at cell and gene names by accessing the colnames and rownames, respectivelly. 
+```{r}
+head(colnames(srat))
+```
+
+
+```{r}
+head(rownames(srat))
+```
+Note: the cell names are the **ROWNAMES** of the **@meta.data** slot, but the **COLNAMES** of the Seurat object
+
+Moving on to the assays slot, we can see that it currently contains just the count data, called $RNA. Normalised data of different sorts will also get stored here.
+```{r}
+srat@assays
+```
+
+Being aware of the active assay is important when doing different types of analysis because tools will try to use the active assay by default if they can. This will make more sense as we proceed with the downstream analysis. You will also have more than one assay in the case of multimodal data: you could have an assay for RNA and another for ATAC or protein data (CITE-Seq). You can check the active assay and modify it by running the following commands:
+```{r}
+srat@active.assay
+
+DefaultAssay(srat) <- 'RNA'
+```
+
+
+
+
+# Quality control
+The main quality control metrics for scRNA-seq data are:
+-   nCount_RNA: cells with very low counts are likely not very informative, or may be dead cells. However, some cell types (e.g. platelets, sperm) are smaller than usual, and thus are expected to have very few counts (\<500). Knowing your biological system is important!
+
+-   nFeature_RNA: the number of unique genes per cell can indicate again whether a cell is informative or not (few genes), but also if they might be a doublet. Doublets (and in particular those originating from 2 different cell types) will have a larger diversity of genes detected. Other methods exist to specifically detect doublets just from gene expression (e.g. scrublet, DoubletFinder, ...) but they will not be covered here.
+
+-   percent.mt: cells negatively affected by tissue processing and isolation tend to have this metric higher. This is likely because, for dying cells, the membrane will burst and release cytoplasmic RNA, but leave the mitochondria intact. However, some cell types may have much higher mitochondrial reads (e.g. hepatocytes), so again, knowing your system is essential!
+
+Get % of reads coming from MT transcripts. In most species, these can be found either by their gene name (starting with "mt-") or by finding if the gene is encoded in the mitochondrial chromosome (retrieving that information from, for example, the Ensembl BioMart).
+In the human genome, all mitochondrial genes start with MT. This is probably not the case for your non-human species of interest, although for mouse it is usually ‘Mt’.
+```{r}
+srat = PercentageFeatureSet(srat, col.name = "percent.mt", assay = "RNA", pattern = "^MT-") 
+
+head(srat@meta.data)
+```
+
+
+Another simple metric that we can quickly calculate is the number of genes detected in the whole dataset (i.e. those that are true for this statement):
+```{r}
+table(rowSums(srat@assays$RNA) > 0)
+```
+
+
+We can use the VlnPlot() function to visualise data stored in our metadata slot. This function will generate violin plots with samples on the x-axis and the variable of interest on the y-axis. We will use these metrics to select which cells (dots) stay within the main range for these QC metrics.
+```{r}
+VlnPlot(srat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+VlnPlot(srat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0)
+
+VlnPlot(srat, features = c("nFeature_RNA", "nCount_RNA"), ncol = 2, log = T) # these two metrics are also useful in log scale
+```
+
+And as scatterplots. This works on small samples because there are not that many points.
+
+Examining the relationship between number of Counts/UMI and Features also shows us how cells can have the same sequencing depth (UMI) but express more/fewer genes (i.e. a biological quantity)
+```{r, fig.width=10, fig.height=5}
+plot1 = FeatureScatter(srat, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 = FeatureScatter(srat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+```
+
+
+Those cells with high percent.mt also tend to have low read counts, extra evidence that these are low quality cells which will not be useful for our analysis.
+
+Read count is well correlated with feature count. This is what we would expect. If there were cells with lots of reads but few features this would suggest problems with the capture of diverse RNA molecules in those cells.
+
+# Filtering cells
+The simplest way to filter out cells is with hard cutoffs across all samples
+
+Based on this exploration, we will pick some thresholds to remove the most outlying droplets: with greater than 500 and less than 4000 detected features, and greater than 3000 and less than 30000 UMI counts. This excludes poor quality cells with little data and potential doublets which have more features than we expect to see in the cells. We will also exclude droplets with less than 20% mitochondrial reads.
+
+We might want to come back and adjust these cut offs once we have seen the UMAP plots. It may be that we still get clusters of low quality cells that should have been removed. Better to be cautious to begin with, to avoid filtering out unusual cell types.
+
+```{r}
+# define condition for filtering
+cells_to_filter <- rownames(subset(srat, subset = nFeature_RNA > 500 & nFeature_RNA < 4000 & nCount_RNA > 3000 & nCount_RNA < 30000 &  percent.mt < 20)@meta.data)
+# add this information to the metadata
+srat$keep <- rownames(srat@meta.data) %in% cells_to_filter
+
+## quickly address how many cells we are keeping
+table(srat$keep)
+```
+Let’s look back at our distribution plots, highlighting the cells that we are retaining and filtering.
+```{r}
+VlnPlot(srat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), log=TRUE, group.by="keep")
+
+```
+Once we are happy with the filtering, we can remove the low quality cells from the Seurat object. Note that features here are genes and samples are cells.
+```{r}
+srat_filt <- subset(srat, subset = keep)
+srat_filt
+
+## other option for filtering based on cell names
+#srat_filt = subset(srat, cells = cells_to_filter)
+
+```
+
+You should save the data at regular intervals (but you don’t have to right now)
+```{r}
+#saveRDS(srat_filt, file = "Example_filt_srat.RDS")
+```
+
+
+
+# Normalisation
+
+## Log transform
+
+Normalise expression of each gene in each cell by the total counts in that cell, with a scaling factor of 10000, and then log-transform the data. This is done to somewhat control expression in each cell for their sequencing depth (although usually it's not sufficient), as well as have the data adopt a more Gaussian distribution (since counts are Negative Binomial/Poisson distributed), to make it more amenable to methods like PCA.
+```{r}
+DefaultAssay(srat_filt) = "RNA"
+srat_filt = NormalizeData(srat_filt, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+Then, we can find the highly variable genes. These are genes that are the most different between cells, and thus more likely to be important to reflect the differences between them. Using HVG can help to highlight cell populations by focusing on the most different genes, as well as reduce some computation times since fewer genes are being considered. However, doing this filtering is not always necessary.
+
+There are many parameters to set as thresholds for this. We can decide on what thresholds to use to define their variability, expression level, etc.; or on how many genes we’d like to get (e.g. top 5000).
+```{r}
+# top 5000
+srat_filt = FindVariableFeatures(srat_filt, selection.method = "vst", 
+                                 nfeatures = 5000)
+```
+```{r, fig.width=10, fig.height=5}
+# Identify the 20 most highly variable genes
+top20 = head(VariableFeatures(srat_filt), 20)
+
+# plot variable features with and without labels
+plot1 = VariableFeaturePlot(srat_filt)
+plot2 = LabelPoints(plot = plot1, points = top20, repel = TRUE)
+plot2
+```
+
+Then we scale the data. ScaleData will perform feature(gene)-level scaling, meaning that each feature will be centered to have a mean of 0 and scaled by the standard deviation of each feature (like how base R scale works). 
+
+Goal: To make the expression of all genes comparable by removing technical variation.
+How it works:
+For each gene, calculate the mean and standard deviation of its expression across all cells.
+For each cell, subtract the gene's mean expression from its expression value.
+Divide the result by the standard deviation to get a scaled value.
+Result: Highly expressed genes no longer dominate the analysis, ensuring all genes have an equal chance of being influential. 
+
+- Shifts the expression of each gene, so that the mean expression across cells is 0
+- Scales the expression of each gene, so that the variance across cells is 1
+- This step gives equal weight in downstream analyses, so that highly-expressed genes do not dominate
+- The results of this are stored in pbmc[["RNA"]]$scale.data
+- By default, only variable features are scaled.
+- You can specify the features argument to scale additional features
+We’re also regressing out the effect of the total UMI counts and mitochondrial RNA. This is to avoid a large amount of the variance being due to differences in read counts between cells. You can add here any source of unwanted variation
+```{r}
+srat_filt = ScaleData(srat_filt, vars.to.regress = c("nCount_RNA", "percent.mt"), 
+                      verbose = T)
+```
+
+
+## SCTransform
+
+Another normalisation method is SCTransform. This method uses Pearson residuals for normalisation, and you can read more about it here: <https://genomebiology.biomedcentral.com/articles/10.1186/s13059-019-1874-1>. Running this will also automatically tell us what are the HVG. An updated tutorial for SCTransform V2 can be found here: <https://satijalab.org/seurat/archive/v4.3/sctransform_v2_vignette>.
+
+Importantly, in Seurat, the result of each of these normalisations can be stored in a different assay - the more common method in the RNA assay, the scTransform method in SCT.
+
+```{r}
+srat_filt = SCTransform(srat_filt, verbose = F,
+                        vars.to.regress = c("nCount_RNA", "percent.mt"),  
+                        variable.features.n = 5000,
+                        seed.use = 123)
+DefaultAssay(srat_filt) = "SCT"
+```
+
+We can compare the intersection of highly variable genes
+```{r}
+list_hvg = list("RNA" = VariableFeatures(srat_filt, assay = "RNA"), 
+                "SCT" = VariableFeatures(srat_filt, assay = "SCT"))
+gplots::venn(list_hvg)
+```
+
+# Dimensionality Reduction 
+
+scRNA-seq datasets commonly have ~10.000 data points (cells) and ~20.000 features (genes). This is of course very hard to visualise! DR algorithms help us visualize the major variability within a dataset.
+
+## PCA
+PCA is the most common linear DR method used in statistics. It “compresses” the data into a set of uncorrelated dimensions (principal components), while also determining the weights for the features (genes) of each PC.
+We do linear dimension reduction (PCA) to determine the principal components of variation in the data. Note the genes associated with the first 5 PCs. Is there anything noticeable about them? If there are recognisable groups of genes associated with a particular PC this likely represents a strong biological signals (the most distinct cell type, variation in cell cycle stage, or a technical problem (low quality cells).
+Also of note, we will keep working with the SCT assay - note the “assay” argument.
+
+```{r}
+srat_filt = RunPCA(srat_filt, verbose = T, assay = "SCT", npcs = 50)
+```
+The result of the PCA is stored in the reductions slot, here as $pca:
+```{r}
+srat_filt@reductions
+
+```
+We can plot the first two principal components using the DimPlot() function.
+```{r}
+DimPlot(srat_filt, reduction = "pca", dims = 1:2)
+
+```
+Looking at the loadings (i.e. gene contributions) of each PC can already tell us a few things about the biological variability in the sample
+```{r, fig.width=9, fig.height=6}
+VizDimLoadings(srat_filt, dims = 1:3, reduction = "pca", ncol = 3)
+```
+Here similar, but more PCs and plotting expression of the top 500 cells in each PC, as well as the top genes
+```{r, fig.width=8, fig.height=10}
+DimHeatmap(srat_filt, reduction = "pca", assays = "SCT", dims = 1:12, 
+           cells = 500, balanced = TRUE, ncol = 3)
+```
+
+We need to pick a number of PCs which capture most of the variance in the data. These will be used for downstream analysis. How many PCs should we use to describe the data? This plot shows how much variance is captured by each PC. 
+This is mostly an “eyeballing” method, to select approximately when the variance explained per PC flattens, which would indicate that most of the datasets variability is present in those top PCs. It is also relevant to note that, should any PC reflect unwanted variability (e.g. sequencing depth per cell, or other technical factors) it can be excluded.
+```{r}
+ElbowPlot(srat_filt, ndims = 50)
+```
+A large proportion of the variation is captured by 15 components and there is a drop off thereafter. Let’s go with 20.
+```{r}
+ncomp = 20
+```
+
+
+# Non-Linear Dimensionality Reduction 
+
+Non-linear dimension reduction methods such as UMAP and TSNE take the PCA data as a starting point, but are able to take more complex (non-linear) patterns hidden in the data and represent them in only two dimensions (which humans are good at examining).These methods will take the main PCs determined above and project them in a lower dimension space, at the cost of distorting distances between points to form organised clumps. Thus, the output of these methods should only be used for visualisation, as a general guide for what the data “looks” like.
+```{r}
+srat_filt <- RunUMAP(srat_filt, dims = 1:ncomp, verbose = F)
+
+```
+Plot the projection
+```{r}
+DimPlot(srat_filt, reduction = "umap")
+
+```
+Bear in mind - do not overinterpret these plots! tSNE and UMAP serve as simple ways to represent your data’s variability in 2D, and allow for eyeballing the approximate number of cell populations in your data. However, one cannot tell how different cell populations are from each other based on their distances, or even how many “real” populations exist - this comes down to interpretation.
+
+If we plot the expression of the B cell marker CD79A (below), we can see that there is a clear cluster of B cells
+```{r}
+FeaturePlot(srat_filt, reduction = "umap", features = c('CD79A'))
+
+```
+# Clustering
+We can use the chosen PCs to get a neighborhood graph for all cells. This graph is done in PC space, determining which cells are more similar to which by their distances in the chosen top PCs.
+```{r}
+red = "pca"
+srat_filt = FindNeighbors(srat_filt, dims = 1:ncomp, verbose = T,
+                          reduction = red, graph.name = paste0(red, ncomp))
+```
+This allows us to detect clusters of cells to then be interpreted. For this we can use community detection algorithms - methods to discover associated groups of points in graphs. We’re using algorithm 2 (Louvain algorithm with multilevel refinement), and we’re getting clusters for multiple resolutions. A higher resolution can return more clusters. Leiden clustering (another algorithm) might currently be the best choice, but it’s more difficult to install.
+```{r}
+srat_filt = FindClusters(srat_filt, algorithm = 2, verbose = T, 
+                         graph.name = paste0(red, ncomp),
+                         resolution = seq(0.2, 1, 0.1))
+```
+```{r}
+head(srat_filt@meta.data)
+
+```
+
+And so we can have a look at all clustering resolutions
+```{r,  fig.width=10, fig.height=10}
+plt_list = list()
+# iterate each clustering resolution
+for(cl in colnames(srat_filt@meta.data)[grepl(paste0("pca", ncomp, "_"), 
+                                              colnames(srat_filt@meta.data))]){
+srat_filt = SetIdent(srat_filt, value = cl) # set the resolution as default identity
+plt_list[[cl]] = DimPlot(srat_filt, reduction = "umap", 
+                         label = T, raster = F, pt.size = 0.2)+
+    labs(subtitle = cl)+
+    theme(legend.position = "none",
+          aspect.ratio = 1)
+}
+cowplot::plot_grid(plotlist = plt_list, ncol = 3)
+
+
+```
+UMAP/tSNE can be a good visual guide for how many clusters can be expected. Alternatively, one can use a package such as clustree to choose a clustering resolution. Resolution can be chosen as the one before clusters start becoming unstable.
+```{r, fig.height = 10, fig.width=8}
+clustree::clustree(srat_filt, prefix = paste0("pca", ncomp, "_res."), node_colour = "sc3_stability")
+
+```
+Then we define that resolution as the default identity
+```{r}
+cl_use = paste0(red, ncomp, "_res.", 0.8)
+srat_filt = SetIdent(srat_filt, value = cl_use)
+```
+
+# Cell type identification
+We can now start to ask “which of these clusters are real cell populations?”. And by real, we mean “biologically relevant”, i.e. they represent a cell type/state in our system being studied.
+
+Since the UMAP plot is generated based on a PCA that should reflect some recognized biological variability, we can expect that the “clumps” that it forms are to some degree related to this. So one strategy is to pick a clustering resolution that coincides with most of these perceived clumps.
+
+Another sensible approach is to use marker genes for expected cell populations in our data. We can check for their expression to have an approximate feeling of what each cluster or group of clusters is before we get their marker genes
+
+We have our clusters, now let’s look at where some markers of interest are expressed. Based on published data, we know that:
+
+- B cells express CD79A
+- Monocytes express CST3
+- T cells express CD3D
+
+```{r}
+# Plot the expression values of each markers on the UMAP
+FeaturePlot(srat_filt, features = c("CD79A", "CST3", "CD3D"), pt.size = 0.1, label = TRUE, reduction = 'umap')
+```
+
+As violin plot
+```{r, fig.width=8}
+VlnPlot(srat_filt, features  = c("CD79A", "CST3", "CD3D"))
+```
+
+- Clusters 4 and 6 seem like be B cells 
+- Clusters 1, 3 and 9 seem like monocytes.
+- Clusters 0, 2, 5 and 8 seem like T cells
+
+What about 7? What are the different custers within each cell type. Are we sure they are correctly assigned?
+
+
+We can calculate the marker genes for a chosen clustering resolution. This is done as a 1 vs rest comparison.
+
+Because of the nature of large sample size in scRNA-seq data (one cell is one sample), it is strongly recommended to not only look at p-values, but also detection rate of the gene in the cluster (pct) and fold change (logFC) between cells in and outside the cluster.
+```{r}
+srat_filt = SetIdent(srat_filt, value = cl_use)
+
+mk_clusters = FindAllMarkers(srat_filt, assay = "SCT", test.use = "wilcox",
+                             logfc.threshold = 0.2, verbose = T, only.pos = T)
+
+
+
+mk_top = mk_clusters %>% 
+  group_by(cluster)  %>%  # for each cluster
+  filter(p_val_adj<=0.05)  %>%  # only p-value below 0.05
+  top_n(n = 20, wt = avg_log2FC) # top genes per cluster, ranked by logFC
+
+mk_top
+```
+
+We can also directly compare pairs of cell populations (1 vs 1 comparison).
+
+
+```{r}
+mk_comp = FindMarkers(srat_filt, ident.1 = "2", ident.2 = "5", assay = "SCT", 
+                   test.use = "wilcox", logfc.threshold = 0.2)
+```
+
+
+
+# Assigning cell type identity to clusters
+
+Fortunately in the case of this dataset, we can use canonical markers to easily match the unbiased clustering to known cell types. Azimuth is a good reference for marker genes, with different levels of "granularity" <https://azimuth.hubmapconsortium.org/references/#Human%20-%20PBMC>
+
+- **Exercise:** based on the cell markers from each cluster, try to annotate them to cell types. 
+
+- **Bonus:** you can add this information to your meta.data, and use it for plotting.
+
+Investigate the markers, are they widespread within the cluster? Or only expressed in few cells? 
+
+Cell type identification/annotation is one of the hardest and most laborious tasks in scRNAseq analysis. You will need to play with clustering resolutions, sub-clustering, and look for markers in lots of papers and databases to annotate your cells (always depending on the level of detail you wish to achieve). Moreover, available methods exist to automatically classify cells into cell types based on previously annotated data. Some of those resources are listed here: <https://www.10xgenomics.com/analysis-guides/web-resources-for-cell-type-annotation>
+
+
+
+It often happens that analysing the total sample does not provide a coherent picture of all subpopulations present. This can happen because the difference between certain cell subtypes might not be large enough to detect them, compared to more distinct populations.
+
+Seurat includes the function below to easily obtain subclusters from specific clusters. However, our advice is for you to not simply subset and cluster, but rather recalculate HVG, PCA, and NN graph for the cell subset. This is because we might find that the initial set of HVG/PCs does not reflect their variability.
+```{r}
+srat_filt = FindSubCluster(srat_filt, cluster = "0", graph.name = paste0(red, ncomp))
+table(srat_filt@meta.data$sub.cluster)
+```
+
+Seurat also includes a way to score groups of cells based on their cell cycle state. This can be helpful if we’re for example looking for proliferating or stem cell populations.
+
+This function is a specific case of the AddModuleScore function, which quantifies the presence of any gene module of choice.
+```{r}
+srat_filt = CellCycleScoring(srat_filt, 
+                             s.features = cc.genes$s.genes, 
+                             g2m.features = cc.genes$g2m.genes, 
+                             set.ident = F,
+                             nbin = 15)
+
+DimPlot(srat_filt, reduction = "umap", group.by = "Phase")
+```
+
+Simpler (and often more accurate) ways of doing this often consist on plotting expression of cell cycle associated genes
+```{r}
+FeaturePlot(srat_filt, features = c("TOP2A", "MKI67", "CDK1"), order = T)
+```
+
+
+```{r}
+#saveRDS(srat_filt, file = "Example_filt_srat.RDS")
+```
+
