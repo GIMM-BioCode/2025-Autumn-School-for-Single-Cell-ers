@@ -1,0 +1,160 @@
+---
+title: "Merging and batch correction"
+output: html_notebook
+---
+
+The goal of this small tutorial is to show how to merge and batch correct two datasets. Here we will use the integration and batch correction approach outlined in <https://www.cell.com/cell/fulltext/S0092-8674(19)30559-8>
+
+Integration of single-cell sequencing datasets, for example across experimental batches, donors, or conditions, is often an important step in scRNA-seq workflows. Integrative analysis can help to match shared cell types and states across datasets, which can boost statistical power, and most importantly, facilitate accurate comparative analysis across datasets.
+
+# Libraries
+```{r}
+library(Seurat)
+
+set.seed(123)
+```
+
+## Read the data
+
+We will use the following datasets for merging and integration. 
+
+- Donor 1: Peripheral blood mononuclear cells (PBMCs) from a healthy human male donor, aged 18-35 were obtained by 10x Genomics from Cellular Technologies Limited.
+- Donor 3: Peripheral blood mononuclear cells (PBMCs) from a healthy human female donor, aged 36-50 were obtained by 10x Genomics from Cellular Technologies Limited.
+
+
+Download and unzip Gene Expression - Feature / cell matrix (per sample) from donor 1 and donor 3 from: <https://www.10xgenomics.com/datasets/5k_Human_Donor1_PBMC_3p_gem-x>
+<https://www.10xgenomics.com/datasets/5k_Human_Donor3_PBMC_3p_gem-x>
+```{r}
+PBMC_donor1.data <- Read10X(data.dir = "/Users/miguel/Documents/scRNAseq course/2025/sample_filtered_feature_bc_matrix_Donor1/")
+PBMC_donor3.data <- Read10X(data.dir = "/Users/miguel/Documents/scRNAseq course/2025/sample_filtered_feature_bc_matrix_Donor3/")
+
+#PBMC_donor1.data <- Read10X(ADD_DATASET_PATH)
+#PBMC_donor3.data <- Read10X(ADD_DATASET_PATH)
+
+
+srat_donor1 <- CreateSeuratObject(counts = PBMC_donor1.data, project = "PBMC_d1")
+srat_donor3 <- CreateSeuratObject(counts = PBMC_donor3.data, project = "PBMC_d3")
+```
+
+
+We can then merge the Seurat objects, storing all information in a single object for ease of use.
+```{r}
+srat_merge <- merge(srat_donor1, 
+              y = c(srat_donor3), 
+              add.cell.ids = c("PBMC_d1", "PBMC_d3"), 
+              project = "pbmc_all")
+```
+
+Mitochondrial RNA and plotting
+```{r}
+srat_merge[["percent.mt"]] <- PercentageFeatureSet(srat_merge, pattern = "^MT-")
+
+VlnPlot(srat_merge, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, group.by = 'orig.ident')
+
+FeatureScatter(srat_merge, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = 'orig.ident')
+```
+
+
+Let's stick to same filters for both, but it is better to filter each dataset independently. 
+```{r}
+# define condition for filtering
+cells_to_filter_merge <- rownames(subset(srat_merge, subset = nFeature_RNA > 1000 & nFeature_RNA < 10000 & nCount_RNA > 1000 & nCount_RNA < 50000 &  percent.mt < 10)@meta.data)
+# add this information to the metadata
+srat_merge$keep <- rownames(srat_merge@meta.data) %in% cells_to_filter_merge
+
+srat_merge <- subset(srat_merge, subset = keep)
+
+```
+
+
+SCTransform, PCA and UMAP
+```{r}
+srat_merge <- SCTransform(srat_merge, 
+                    vars.to.regress = c("nCount_RNA", "percent.mt"), 
+                    variable.features.n = 5000) %>% 
+  RunPCA(assay = "SCT", npcs = 50) %>% 
+  RunUMAP(dims = 1:20)
+  
+```
+
+Plot UMAP coloured by orig.ident
+```{r}
+DimPlot(srat_merge, reduction = 'umap', group.by = 'orig.ident')
+```
+Batch effect. But will it affect the results?
+ 
+Let’s call clusters and see how the replicates are distributed in the them. If there are clusters with lots of one replicate and little of the other, this suggests that these clusters are driven by technical variation, which ought to be removed before analysis.
+
+The clustering is done in two steps: generate a nearest-neighbours graph; call clusters (or “communities”) on this graph.
+```{r}
+srat_merge <- FindNeighbors(srat_merge, dims = 1:20) 
+srat_merge <- FindClusters(srat_merge, resolution = 0.1)
+```
+```{r}
+table(Cluster = srat_merge$SCT_snn_res.0.1, Batch = srat_merge$orig.ident)
+```
+By tabulating how many cells from each technical replicate fall in each cluster, we can see that some clusters have almost none of one replicate and lots of the other. If we proceeded with the uncorrected data in our downstream analysis, it might lead us to conclude that there are biological differences between our samples, which in this case we know should be very similar.
+
+# Data integration
+
+We can perform batch correction by using a method of data integration implemented in Seurat, which aims to bring cells of different samples closer together (while retaining as much of the biological variance as possible). Note, we used CCA but there are many (RPCA, Harmony, ...) 
+<https://satijalab.org/seurat/articles/seurat5_integration>
+
+Firstly, we normalize and identify variable features for each dataset independently and make a list of the normalised Seurat objects
+```{r}
+# loop through the two samples
+pbmc_list <- lapply(c(srat_donor1, srat_donor3), function(x) {
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+})
+```
+Then, we select features that are repeatedly variable across datasets which can be used for for integration. We are using a high value here (10000 features). You could try varying this to see if using fewer features affects the results.
+```{r}
+integration_features <- SelectIntegrationFeatures(object.list = pbmc_list, nfeatures=10000)
+```
+
+Perform the integration (this takes a while).
+
+Here we left the Dimensional reduction to perform when finding anchors as the default Canonical Correlation Analysis (CCA), but there are more options. You can try the different integration methods and see how they compare.
+```{r}
+pbmc_anchors <- FindIntegrationAnchors(object.list = pbmc_list, anchor.features = integration_features)
+```
+
+```{r}
+pbmc_integrated <- IntegrateData(anchorset = pbmc_anchors)
+
+```
+We now have an ‘integrated’ assay, as well as the standard ‘RNA’ assay.
+```{r}
+pbmc_integrated@assays
+
+```
+
+To proceed with the corrected data, we need to change our default assay. Note that the original unmodified data still resides in the ‘RNA’ assay.
+```{r}
+DefaultAssay(pbmc_integrated) <- "integrated"
+```
+
+Run the standard workflow for visualization and clustering:
+```{r}
+pbmc_integrated <- ScaleData(pbmc_integrated, verbose = FALSE)
+pbmc_integrated <- RunPCA(pbmc_integrated, npcs = 50, verbose = FALSE)
+pbmc_integrated <- RunUMAP(pbmc_integrated, reduction = "pca", dims = 1:20)
+
+```
+
+Finally we are ready to visualise the corrected cells. The data look much better integrated, with a lot of overlapping between the different samples within clusters.
+```{r}
+DimPlot(pbmc_integrated, reduction = "umap", group.by = "orig.ident")
+```
+We can move on to identify clusters of corrected cells and see how the replicates are distributed:
+```{r}
+pbmc_integrated <- FindNeighbors(pbmc_integrated, dims = 1:20)
+pbmc_integrated <- FindClusters(pbmc_integrated, resolution = 0.1)
+
+```
+```{r}
+table(Cluster = pbmc_integrated$integrated_snn_res.0.1, Batch = pbmc_integrated$orig.ident)
+
+```
+
