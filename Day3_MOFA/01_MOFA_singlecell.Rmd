@@ -1,0 +1,1390 @@
+---
+title: "Workshop MOFA GIMM Autumn School for Single Cell-ers"
+date: "`r Sys.Date()`"
+author: "Francisca G. Vieira"
+output:
+  BiocStyle::html_document:
+    toc: true
+    toc_depth: 1
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# Introduction
+
+This workshop aims at using MOFA for the integration of single-cell data, 
+for 3 different cases: 1) multi-omics data, 2) cell lineages, 
+3) with time as covariate (MEFISTO).
+
+In particular we will be working with the data from the following study:
+[Multi-omics profiling of mouse gastrulation at single-cell
+resolution](https://www.nature.com/articles/s41586-019-1825-8). This
+study sequenced mouse embryonic stem cells as they undergo the process
+of gastrulation, during which the three primary germ layers are formed.
+
+# Notes
+
+This document contains three parts. You can also use separate Rmd
+files for each part to avoid too long execution times of the full
+notebook. Remember that you will need to load the libraries and specify
+the data directory as done above in each individual file.
+
+
+# Load libraries
+
+To get started please load the following libraries that you will need
+for this analysis.
+
+```{r, message=FALSE}
+library(ggplot2)
+library(MOFA2)
+library(dplyr)
+library(Seurat)
+library(data.table)
+library(tibble)
+library(tidyr)
+```
+
+#Seed
+
+```{r}
+# Set seed
+set.seed(42)
+```
+
+# Data directory
+Modify the data directory below to point to the folder containing the data.
+
+```{r}
+data_dir <- "./Workshop_data"
+```
+
+
+# Part 1 - Integration of multi-omics data
+
+## Data - upload, process and visualize
+
+The first step in every single-cell experiment is to get the data into a
+usable format and to do quality control. Since these steps can often be
+quite resource intensive, and this workshop is focused on the application of MOFA, 
+we start from preprocessed and filtered data. 
+
+In case you are interested in the preprocessing steps, you can have a look
+at the [full analysis folder of the
+paper](https://github.com/rargelaguet/scnmt_gastrulation). You can also
+find links to the full data there. 
+
+### Metadata
+
+Here we provide you with a metadata file that will give an overview of the 
+quality control and links samples across the different layers.
+
+Read in the file `samples_metadata.rds` and take a look at it 
+- what is the meaning of each column? 
+
+```{r}
+samples_metadata <- readRDS(file.path(data_dir, "Data_processed/samples_metadata.rds"))
+samples_metadata
+```
+
+
+Columns: - **sample**: cell ID\
+- **pass_rnaQC**: did the cell pass QC for RNA expression?.\
+- **pass_metQC**: did the cell pass QC for DNA methylation? `NA` if the
+cell was only profiled for RNA.\
+- **pass_accQC**: did the cell pass QC for chromatin accessibility? `NA`
+if the cell was only profiled for RNA. 
+- **stage**: developmental
+stage.\
+- **lineage**: cell type annotation (derived from mapping the cells to
+the [10x mouse gastrulation reference
+atlas](https://www.nature.com/articles/s41586-019-0933-9)).
+
+
+
+### RNA data
+
+We will first a first look into the RNA data. The data is already normalised and scaled, so no need for further processing.
+
+Read the RNA object and produce a PCA plot of all cells and colour by lineage. 
+
+```{r}
+#Read RNA dataframe
+rna <- readRDS(file.path(data_dir, "Data_processed/rna_df.rds"))
+rna 
+```
+
+
+```{r}
+# PCA
+
+#Transpose matrix
+pca_input <- t(rna)
+
+#Run PCA
+pca_res <- prcomp(pca_input, scale. = F)
+
+# Take first two PCs
+pca_df <- data.frame(pca_res$x[, 1:2])
+pca_df$sample <- rownames(pca_df)
+
+# Add metadata
+pca_df <- merge(pca_df, samples_metadata, by = "sample")
+head(pca_df)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = lineage)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "", x = "PC1", y = "PC2")
+
+```
+
+
+### Methylation data
+
+Read methylation data files.
+
+```{r}
+met_en <- readRDS(file.path(data_dir, "Data_processed/met_en_df.rds"))
+met_prom <- readRDS(file.path(data_dir, "Data_processed/met_prom_df.rds"))
+```
+
+
+### Accessibility data
+
+Read accessibility data files.
+
+```{r}
+acc_en <- readRDS(file.path(data_dir, "Data_processed/acc_en_df.rds"))
+acc_prom <- readRDS(file.path(data_dir, "Data_processed/acc_prom_df.rds"))
+```
+
+
+As input to the model DNA methylation and chromatin accessibility values
+are quantified over two different sets of regulatory elements: gene
+promoters and enhancer elements.
+
+## Integrating the data from different omic layers using MOFA
+
+We will now combine the information from all three omic layers.
+To create a MOFA object you need to specify four dimensions: 
+samples, features, view(s) and group(s). 
+MOFA objects can be created from a wide range of input formats, including:
+
+- a list of matrices: this is recommended for relatively simple data.
+- a long data.frame: this is recommended for complex data sets with multiple views and/or groups.
+
+We will now create a list of matrices, where each entry corresponds to one view. 
+Samples are stored in columns and features in rows.
+
+```{r}
+# Create a named list for MOFA
+mofa_input_data <- list(
+  "RNA" = as.matrix(rna),
+  "Enhancers methylation" = as.matrix(met_en),
+  "Promoters methylation" = as.matrix(met_prom),
+  "Enhancers accessibility" = as.matrix(acc_en),
+  "Promoters accessibility" = as.matrix(acc_prom)
+)
+```
+
+```{r}
+# Create MOFA object directly from list and give metadata
+MOFAobject <- create_mofa(mofa_input_data)
+
+MOFAobject@samples_metadata <- MOFAobject@samples_metadata %>%
+  left_join(samples_metadata, by = "sample")
+```
+
+
+### Overview of training data
+
+The function `plot_data_overview` can be used to obtain an overview of
+the input data. It shows how many views (rows) and how many cells
+(columns) exist, what their corresponding dimensionalities are. It
+also shows which views each cell is missing.
+
+```{r fig.align="center"}
+view.colors <- c(
+  "RNA" = "#3CB54E",
+  "Enhancers accessibility" = "#00BFC4",
+  "Promoters accessibility" = "#00BFC4",
+  "Enhancers methylation" = "#F37A71",
+  "Promoters methylation" = "#F37A71"
+)
+view.colors = view.colors[views_names(MOFAobject)]
+
+plot_data_overview(MOFAobject, colors = view.colors)
+```
+
+Notice that there are a lot of cells that only have RNA expression
+measurements. One of the major advantages of MOFA is that it handles
+missing values, so we don't have to remove these cells prior to model
+training
+
+### Define MOFA options
+
+In MOFA we can define options in the model, data and training. We will use the 
+default options in this workshop, but for future use, it's good to have an idea 
+of what is there:
+
+#### Model options
+
+Two important options:
+
+- **num_factors**: number of factors: we will start with 10 here, but feel free to explore how the model changes when another number of factors is used instead
+- **likelihoods**: likelihood per view (options are "gaussian", "poisson", "bernoulli"). By default the "gaussian" distribution is used. For example, if we would have a view with biological binary data (e.g. Somatic mutations) we could change the likelihood to "bernoulli". 
+
+```{r}
+model_opts = get_default_model_options(MOFAobject)
+model_opts$num_factors=10
+```
+
+#### Data options
+
+Have a look into the default data and training options, and understand their meaning.
+
+```{r}
+data_opts = get_default_data_options(MOFAobject)
+data_opts
+
+train_opts = get_default_training_options(MOFAobject)
+train_opts
+```
+
+### Prepare MOFA
+
+```{r}
+#Prepare MOFA using default options
+MOFAobject <- prepare_mofa(MOFAobject, model_options = model_opts)
+```
+
+### Train MOFA
+
+```{r}
+#Train the model
+MOFAobject <- run_mofa(MOFAobject,
+                       use_basilisk = TRUE
+                       )
+```
+
+
+
+## Downstream analysis
+
+Now we will focus on the downstream characterization of the MOFA model.
+
+
+### Load pre-computed MOFA model (OPTIONAL)
+
+**In case you were not able to train the model, you can also load a pre-computed one.**
+
+```{r}
+MOFAobject <- readRDS(file.path(data_dir, "MOFAmodel1.rds"))
+```
+
+### Explore individual views
+
+How many cells do not have DNA methylation measurements?
+
+Remember that those cells have `FALSE` in the `pass_metQC` column.
+
+```{r}
+sum(samples_metadata(MOFAobject)$pass_metQC == FALSE)
+```
+
+Plot a histogram of the values for the RNA, methylation and
+accessibility views. How good is the normal distribution as an
+approximation for the data? Optional: What could be other ways of
+modelling this distribution?
+
+
+```{r}
+rna <- get_data(MOFAobject, views="RNA")[[1]][[1]]
+hist(rna,xlim=c(0,20),breaks = 50000)
+```
+
+The RNA expression distribution looks zero-inflated. This is a
+statistical challenge for some single-cell RNA-seq assays. To model
+this data we probably want to use a zero-inflated Gaussian distribution,
+but this not implemented in the MOFA framework. Instead, we used a
+Gaussian distribution, which should provide a decent approximation but
+it will likely underestimate the mean expression values.
+
+
+```{r}
+met <- get_data(MOFAobject, views="Promoters methylation")[[1]][[1]]
+hist(met)
+```
+
+```{r}
+acc <- get_data(MOFAobject, views="Promoters accessibility")[[1]][[1]]
+hist(acc)
+```
+
+The distribution of M-values shows some similarity to Gaussian
+likelihood but also here the approximation is not perfect. Ideally this
+data modality should be modeled with a binomial distribution: for every
+cell $i$ and region $j$ the total number of CpGs correspond to the total
+number of trials and the number of methylated CpGs to the number of
+successes. We keep the approximation with a normal, given that is already implemented 
+in MOFA. (Have a look on the function `get_default_model_options()` to know more
+about the implemented likelihoods in MOFA)
+
+
+### Variance decomposition analysis
+
+The most important insight that MOFA generates is the variance
+decomposition analysis using `plot_variance_explained`. This plot shows
+the percentage of variance explained by each factor in each data
+modality. From this we can identify shared sources of variation across
+multiple omic modalities.
+
+```{r}
+plot_variance_explained(MOFAobject) +
+  theme(
+    axis.text.x = element_text(angle=25, hjust=1, vjust=1.05)
+  )
+```
+
+What insights from the data can we learn just from inspecting
+this plot?
+
+-   Factor 1 and Factor 3 capture strong sources of variability that
+    drive significant amounts of variation in RNA expression. 
+    Factor 1 also captures variation in epigenetic status of enhancer elements, 
+    but not in promoter elements.
+-   Factor 2 captures sources of variation present in all modalities.
+-   Factor 4 captures a strong source of variation that is shared
+    between RNA expression and DNA methylation of enhancer elements.
+
+
+### Characterization of Factors
+
+There are a few systematic strategies to characterize the molecular
+signal that underlies each MOFA factor:
+
+-   Association analysis between the sample metadata and the Factor
+    values: function `correlate_factors_with_covariates`
+    
+-   Inspection of factor values: functions `plot_factor` (one factor
+    at a time) and `plot_factors` (combinations of factors)
+    
+-   Inspection of the feature weights: functions `plot_weights` (all
+    weights), `plot_top_weights` (only the top weights)
+    
+-   Gene set enrichment analysis on the mRNA weights: functions
+    `run_enrichment`, followed by `plot_enrichment` (check optional part in the 
+    end of the tutorial)
+
+
+#### Characterization of Factor 1
+
+#### Factor values
+
+Plotting Factor 1 values and colouring cells by lineage assignment shows
+that this factor captures the variation that is associated with the
+separation between Mesoderm (positive Factor values) and non-Mesoderm
+cells (negative Factor values).
+
+```{r}
+plot_factor(MOFAobject,
+  factor = 1,
+  color_by = "lineage", 
+  add_violin = TRUE,
+  dodge = TRUE
+) 
+```
+
+*How do we interpret the factor values?* Each factor captures a
+different source of variability in the data. Mathematically, each Factor
+is defined by a linear combination of the input features. Each Factor
+ordinates cells along a one-dimensional axis that is centered at zero.
+Samples with different signs manifest opposite phenotypes along the
+inferred axis of variation, with higher absolute value indicating a
+stronger effect.
+Note that the interpretation of MOFA factors is analogous to the
+interpretation of the principal components in PCA.
+
+#### RNA weights
+
+The weights provide a score for each gene on each factor. Genes with no
+association with the factor are expected to have values close to zero,
+whereas genes with strong association with the factor are expected to
+have large absolute values. The sign of the weight indicates the
+direction of the effect: a positive weight indicates that the feature is
+more active in the cells with positive factor values, and vice versa.
+
+Let's plot the distribution of weights for Factor 1.
+
+```{r, warnings=FALSE, message=FALSE}
+plot_weights(MOFAobject,
+  view = "RNA",
+  factor = 1,
+  nfeatures = 10,     # Top number of features to highlight
+  scale = T           # Scale weights from -1 to 1
+)
+```
+
+If you are not interested in the full distribution, but just on the top
+weights, you can instead do:
+
+```{r}
+plot_top_weights(MOFAobject, 
+  view = "RNA", 
+  factor = 1, 
+  nfeatures = 10,
+  scale = T, 
+  abs = T
+)
+```
+
+We expect that genes with large positive weights for Factor 1 to be
+highly expressed in the Mesoderm cells. If we plot Factor 1 colouring
+cells by gene expression of the top genes with positive weight:
+
+```{r}
+genes <- c("Lefty2","Mesp1")
+
+for (i in genes) {
+  plot_factor(MOFAobject,
+    factor = 1,
+    dot_size = 2.5,
+    group_by = "lineage",
+    color_by = i
+  ) %>% print
+}
+```
+
+Similarly, we expect that genes with large negative weights For Factor 1
+to be lowly expressed in the Mesoderm cells. If we plot Factor 1
+colouring cells by gene expresion of the top genes with negative
+weight:
+
+```{r}
+genes <- c("Cldn6","Cdh1")
+
+for (i in genes) {
+  plot_factor(MOFAobject,
+    factor = 1,
+    dot_size = 2.5,
+    group_by = "lineage",
+    color_by = i
+  ) %>% print
+}
+```
+
+#### RNA expression patterns in the high-dimensional space
+
+The weights are useful to identify which genes are driving each factor.
+After inspecting the weights it is good practice to go back to the
+high-dimensional space and check if the variability that MOFA captures
+is real.
+
+For example, one could generate a heatmap plot of the RNA expression for
+the top genes, where samples are sorted by the corresponding factor
+values. This is the aim of the `plot_data_heatmap` function:
+
+```{r}
+plot_data_heatmap(MOFAobject, 
+  view = "RNA", 
+  factor = 1, 
+  features = 25,
+  annotation_samples = "lineage",
+  # extra arguments passed to `pheatmap`,
+  show_colnames = F, cluster_cols = F
+)
+```
+
+An interesting option of `plot_data_heatmap` is to plot "denoised"
+observations. This is obtained by reconstructing the data using the
+matrix factorization equation from MOFA:
+
+$$\hat{\mathbf{Y}}^m = \mathbf{W}^m\mathbf{Z}$$ where $\mathbf{W}^m$ is
+the weight matrix for the $m$-th view, and $\mathbf{Z}$ is the (shared)
+factor matrix.\
+This data reconstruction step essentially removes all the variation that
+is not captured by the model:
+
+```{r}
+plot_data_heatmap(MOFAobject, 
+  view = "RNA", 
+  factor = 1, 
+  denoise = TRUE,
+  features = 25,
+  # extra arguments passed to `pheatmap`
+  show_colnames = F, cluster_cols = F 
+)
+```
+
+#### DNA methylation weights
+
+As we have done with RNA, we can also visualise the distribution of
+weights for the epigenetic modalities. The problem about this is that
+the large majority of enhancers are not well annotated and we only have
+the genomic coordinates for them...
+
+```{r}
+plot_weights(MOFAobject,
+  view = c("Enhancers methylation"),
+  factor = 1,
+  nfeatures = 5,
+  scale = F
+)
+```
+
+#### DNA methylation patterns in the high-dimensional space
+
+As done with the RNA above, let's visualise in the high-dimensional
+space the DNA methylation variation that MOFA captures using the
+`plot_data_heatmap` function. Notice how noisy and sparse DNA
+methylation data is.
+
+```{r, out.width="130%"}
+plot_data_heatmap(MOFAobject, 
+  view = "Enhancers methylation", 
+  factor = 1, 
+  features = 25,
+  annotation_samples = "lineage",
+  # extra arguments passed to `pheatmap`
+  show_colnames = F, cluster_cols = F, 
+  fontsize = 6
+)
+```
+
+We will use MOFA to impute the missing values. This is based on the data
+reconstruction equation shown above.
+
+```{r}
+MOFAobject <- impute(MOFAobject)
+```
+
+Plot heatmap with `impute=TRUE` argument.
+
+```{r, out.width="130%"}
+plot_data_heatmap(MOFAobject, 
+  view = "Enhancers methylation", 
+  factor = 1, 
+  impute = TRUE,
+  features = 25,
+  annotation_samples = "lineage",
+  # extra arguments passed to `pheatmap`
+  show_colnames = F, cluster_cols = F, 
+  fontsize = 6
+)
+```
+
+As we guessed from the variance decomposition analysis, the promoters do
+not display interesting signal during germ layer commitment
+
+```{r, out.width="130%"}
+plot_data_heatmap(MOFAobject, 
+  view = "Promoters methylation", 
+  factor = 1, 
+  impute = TRUE,
+  features = 25,
+  annotation_samples = "lineage",
+  # extra arguments passed to `pheatmap`
+  show_colnames = F, cluster_cols = F, 
+  fontsize = 6
+)
+```
+
+#### Characterization of Factor 2
+
+Can you use the functions and analyses' strategies introduced
+above to characterize Factor 2 in the model?
+
+-   What germ layer does it capture?
+-   Which genes' expression is linked to it?
+-   How do methylation values change along this factor?
+
+
+Visualization of Factor values
+
+```{r}
+plot_factor(MOFAobject,
+  factor = 2,
+  color_by = "lineage", 
+  add_violin = TRUE,
+  dodge = TRUE
+) 
+```
+
+Visualization of RNA weights
+
+```{r, warnings=FALSE, message=FALSE}
+plot_weights(MOFAobject,
+  view = "RNA",
+  factor = 2,
+  nfeatures = 10,     # Top number of features to highlight
+  scale = T           # Scale weights from -1 to 1
+)
+
+plot_top_weights(MOFAobject, view = "RNA", factor = 2, nfeatures = 35)
+```
+
+Plot the expression of the genes with largest weight
+
+```{r}
+genes <- c("Dgkk","Samd3")
+
+for (i in genes) {
+  plot_factor(MOFAobject,
+    factor = 2,
+    dot_size = 2.5,
+    group_by = "lineage",
+    color_by = i
+  ) %>% print
+}
+```
+
+Visualization of DNA methylation patterns in the high-dimensional space
+
+```{r, out.width="130%"}
+plot_data_heatmap(MOFAobject, 
+  view = "Enhancers methylation", 
+  factor = 2, 
+  impute = FALSE,
+  features = 25,
+  annotation_samples = "lineage",
+  # extra arguments passed to `pheatmap`
+  show_colnames = F, cluster_cols = F, 
+  fontsize = 6
+)
+```
+
+```{r, out.width="130%"}
+plot_data_heatmap(MOFAobject, 
+  view = "Enhancers methylation", 
+  factor = 2, 
+  impute = TRUE,
+  features = 25,
+  annotation_samples = "lineage",
+  # extra arguments passed to `pheatmap`
+  show_colnames = F, cluster_cols = F, 
+  fontsize = 6
+)
+```
+
+
+
+### 2-dimensional representation
+
+The first two factors capture in two dimensions all the variation that
+is required to separate the three germ layers. It corresponds to [Figure
+2b in the original
+paper](https://www.nature.com/articles/s41586-019-1825-8).
+
+```{r}
+plot_factors(MOFAobject,
+  factors = c(1,2), 
+  color_by = "lineage",
+  dot_size = 2,
+  legend = TRUE
+) 
+```
+
+
+Change the `color_by` argument to a gene name to colour the
+scatterplot above by the expression of genes that you have identified in
+the previous analyses as markers for the the different germ layers with
+highest or lowest weight on the factor. Is their expression in line with
+the variation captured in the 2-dimensional plot?
+
+
+```{r}
+# Ectoderm marker
+plot_factors(MOFAobject,
+  factors = c(1,2), 
+  color_by = "Pim2", 
+  dot_size = 2
+)
+
+# Mesoderm marker
+plot_factors(MOFAobject,
+  factors = c(1,2), 
+  color_by = "Mesp1", 
+  dot_size = 2
+)
+
+# Endoderm marker
+plot_factors(MOFAobject,
+  factors = c(1,2), 
+  color_by = "Chrd", 
+  dot_size = 2
+)
+```
+
+
+### Are the changes in DNA methylation and chromatin accessibility correlated at the loci level?
+
+Using MOFA we have identified coordinated axes of variation between the
+three omics. However, this does not necessarily imply that the same
+features are driving the signal in all of the omics. It could be that
+DNA methylation changes associated with endoderm commitment (Factor 2)
+are driven by enhancers A,B,C whereas chromatin accessibility changes
+are driven by enhancers D,E,F.\
+To explore this, we will correlate the weights for both epigenetic
+modalities. This cannot be done internally within MOFA so we have to
+extract the weights manually do our own downstream analysis This is done
+with the function `get_weights`:
+
+```{r}
+# Fetch weights
+w.met <- get_weights(MOFAobject, 
+  factors = c(1,2), 
+  views = "Enhancers methylation", 
+  scale = TRUE,
+  as.data.frame = T
+) %>% as.data.table
+
+w.acc <- get_weights(MOFAobject, 
+  factors = c(1,2), 
+  views = "Enhancers accessibility", 
+  scale = TRUE,
+  as.data.frame = T
+) %>% as.data.table
+
+# Remove the met_ and acc_ prefix from the feature names
+w.met[,feature:=substr(feature,5,nchar(as.character(feature)))]
+w.acc[,feature:=substr(feature,5,nchar(as.character(feature)))]
+
+# Merge weights
+w.dt <- merge(
+  w.met[,c("feature","factor","value")], 
+  w.acc[,c("feature","factor","value")], 
+  by=c("feature","factor")
+)
+```
+
+Notice how the DNA methylation and chromatin accessibility weighs are
+highly correlated, suggesting that the variability in both epigenetic
+layers is highly coupled not just globally but also at the individual
+loci level.
+
+```{r}
+ggplot(w.dt, aes(x=value.x, y=value.y)) +
+  geom_point() + 
+  stat_smooth(method="lm") +
+  theme_classic() +
+  facet_wrap(~factor) +
+  labs(x="DNA methylation weight", y="Chromatin accessibility weight")
+```
+
+# Part 2: Using lineages as views 
+
+
+Now we will use MOFA to estimate a latent space that captures the variability of
+samples across the distinct lineages. Specifically, we represent the cross-conditional
+single-cell transcriptomics data as a multi-view structure, where each lineage 
+represents an individual view that contains summarized information per sample 
+(e.g. pseudobulk). The estimated factors composing the latent space can be
+interpreted as a multicellular program that captures coordinated expression
+patterns of distinct lineages. Similarly, as in the application of MOFA to
+multi-omics data, the factors can be used for an unsupervised analysis of samples
+or can be associated to biological or technical covariates of the original samples. 
+Additionally, the reconstruction errors per view and factor can be used to prioritize 
+cell types associated with covariates of interest.
+
+
+For this we will use only the RNA data. Please upload the complete RNA set.
+
+## Data
+
+```{r}
+#Optional
+#remove everything except data directory
+rm(list = setdiff(ls(), "data_dir"))
+```
+
+### Metadata
+```{r}
+metadata <- fread(file.path(data_dir, "Data/sample_metadata.txt"))
+metadata
+```
+
+### RNA data
+
+```{r}
+# read in RNA Seurat object
+rna <- readRDS(file.path(data_dir, "Data/rna/seurat_object.rds"))
+
+# Add the metadata table to the seurat object
+rna <- AddMetaData(rna, metadata = data.frame(metadata, row.names = metadata$sample))
+```
+
+
+There are two cell type columns: lineage10x and lineage10x_2. The first one is obtained by mapping the scNMT-seq cells to the RNA gastrulation atlas. The problem with the most this annotation is that we have very few cells per cell type. In the second column these lineages are aggregated into bigger classes:
+
+
+```{r}
+table(metadata$lineage10x)
+
+table(metadata$lineage10x_2)
+
+```
+
+
+```{r}
+# Make sure only cells that pass the qc are used
+rna <- rna[, rna$pass_rnaQC == TRUE]
+```
+
+
+```{r}
+# Log t
+rna <- NormalizeData(rna)
+rna <- FindVariableFeatures(rna, nfeatures = 500)
+
+VariableFeaturePlot(rna)
+
+rna <- ScaleData(rna)
+
+rna <- RunPCA(rna, features = VariableFeatures(object = rna))
+
+DimPlot(rna, reduction = "pca", group.by = "stage", shape.by = "lineage10x_2")
+```
+
+```{r}
+rna <- RunUMAP(rna, dims = 1:10, n.neighbors = 20, min.dist = 0.7)
+```
+
+```{r}
+DimPlot(rna, reduction = "umap", group.by = "stage")
+DimPlot(rna, reduction = "umap", group.by = "lineage10x_2")
+DimPlot(rna, reduction = "umap", group.by = "embryo")
+```
+
+
+## Create pseudobulk profiles per embryo × lineage
+
+```{r}
+# Keep only variable genes for pseudobulk
+var_genes <- VariableFeatures(rna)
+
+
+#Create embryo_lineage inside meta.data
+rna@meta.data <- rna@meta.data %>%
+  mutate(
+    embryo_lineage = paste(embryo, lineage10x_2, sep = "--")
+  ) 
+
+rna@meta.data <- rna@meta.data %>%
+  mutate(
+    embryo_lineage = gsub("_", "-", rna@meta.data$embryo_lineage)
+  )
+
+#Aggregate pseudobulk expression by embryo_lineage
+pb_expr <- AggregateExpression(
+  rna,
+  group.by = "embryo_lineage",
+  assays = "RNA",
+  features = var_genes,
+  return.seurat = T
+)
+
+#Build metadata for the pseudobulk object
+meta_pseudobulk <- data.frame(
+  embryo_lineage = colnames(pb_expr),
+  embryo = sapply(strsplit(colnames(pb_expr), "--"), `[`, 1)
+)
+
+meta_lookup= rna@meta.data[, c("embryo_lineage", "stage", "lineage10x_2")]
+
+# Join with stage and lineage info
+meta_pseudobulk <- dplyr::left_join(meta_pseudobulk, meta_lookup, by = "embryo_lineage") %>%
+  dplyr::select(embryo_lineage, embryo, lineage10x_2, stage) %>%
+  distinct()
+
+#Add back to the pseudobulk Seurat object
+pb_expr@meta.data <- meta_pseudobulk
+pb_expr@meta.data
+```
+
+
+
+## Prepare long dataframe for MOFA input
+
+```{r}
+
+#Prepare long dataframe for input in MOFA
+expr_mat <- GetAssayData(pb_expr, slot = "data")  # genes x pseudobulks
+
+# Make sure genes are a proper column
+expr_df <- as.data.frame(expr_mat) %>%
+  rownames_to_column(var = "feature")
+
+
+# Pivot to long format
+long_df <- expr_df %>%
+  pivot_longer(
+    cols = -feature,
+    names_to = "embryo_lineage",
+    values_to = "value") %>%
+  left_join(pb_expr@meta.data, by = "embryo_lineage") %>%
+  dplyr::rename(
+    sample = embryo,
+    view = lineage10x_2
+  ) %>%
+  dplyr::select(feature, sample, view, value)
+```
+
+
+## Create and train MOFA model
+
+```{r}
+#Create object
+MOFAobject <- create_mofa(long_df)
+
+#Overview of data
+plot_data_overview(MOFAobject)
+```
+```{r}
+#Prepare
+model_opts <- get_default_model_options(MOFAobject)
+model_opts$num_factors = 3
+
+MOFAobject <- prepare_mofa(MOFAobject, model_options = model_opts)
+
+```
+
+```{r}
+#Train
+MOFAobject <- run_mofa(MOFAobject, use_basilisk = T)
+```
+
+
+
+```{r}
+#Add metadata info (e.g stage)
+MOFAobject@samples_metadata <- MOFAobject@samples_metadata %>%
+  left_join(
+    meta_pseudobulk %>%
+      dplyr::select(embryo, stage) %>%
+      dplyr::distinct() %>%
+      dplyr::rename(sample = embryo),
+    by="sample")
+```
+
+
+### Load pre-computed MOFA model (OPTIONAL)
+
+**In case you were not able to train the model, you can also load a pre-computed one.**
+
+```{r}
+MOFAobject <- readRDS(file.path(data_dir, "MOFAmodel2.rds"))
+```
+
+
+
+## Downstream interpretation of factors
+
+For this part, you can use Part 1 as a reference to get more insights into the
+interpretation and characterization of the factors. 
+
+*Are the factors capturing the variation of the different lineages, how do you interpret them?*
+
+```{r}
+plot_variance_explained(MOFAobject, x="view", y="factor")
+```
+
+
+```{r}
+plot_factor(MOFAobject,
+  factor = 1:3,
+  color_by = "stage",
+  add_violin = TRUE,
+  dodge = TRUE
+)
+
+plot_factors(MOFAobject, factors = 1:2, color_by = "stage")
+
+```
+```{r}
+
+plot_data_heatmap(MOFAobject,
+  view="Epiblast",
+  factor = 3, 
+  features = 25,
+  annotation_samples = "stage",
+  # extra arguments passed to `pheatmap`,
+  show_colnames = F, cluster_cols = F
+)
+```
+You can pick an interesting gene from this plot and have a deeper look into its expression
+along the different stages and its values in the correspondent factor. 
+
+```{r}
+plot_factor(MOFAobject,
+    factor = 3,
+    dot_size = 2.5,
+    group_by = "stage",
+    color_by = "ENSMUSG00000060461_Epiblast",
+    add_violin = T,
+    dodge=T
+  ) + ylim(-1,1)
+
+```
+
+
+```{r}
+# Top genes in Mesoderm for Factor 1
+plot_top_weights(MOFAobject, 
+  view = "Mesoderm", 
+  factor = 1, 
+  nfeatures = 15,
+  scale = F, 
+  abs = T
+)
+```
+
+For a more complete analysis, it is recommended to follow the other suggested
+plots as in Part 1. 
+
+
+# Part 3: Using pseudo-time annotations of cells with MEFISTO
+
+In [MEFISTO](https://www.nature.com/articles/s41592-021-01343-9) we can
+make use of pseudotime information for each cell to distinguish patterns
+of variation (i.e., factors) that vary smoothly along pseudotime from
+other non-smooth sources of variation, e.g. cell cycle.
+
+To reproduce this we can train a similar model on the data from all
+4 stages and additionally pass the pseudo-time values for each cell to
+MOFA. 
+
+We will use only the RNA data with all stages and lineages. MEFISTO takes more time
+and computational power than MOFA, so we will first subset the data.
+(If you have access to a computer cluster, you can also try to run with the whole dataset).
+
+## Data
+```{r}
+#Optional
+#remove everything except data directory
+rm(list = setdiff(ls(), "data_dir"))
+```
+
+## RNA data
+
+```{r}
+# Read the data again if necessary (rna object might be changes from last part)
+rna <- readRDS(file.path(data_dir, "Data/rna/seurat_object.rds"))
+metadata <- fread(file.path(data_dir, "Data/sample_metadata.txt"))
+
+# Add the metadata table to the seurat object
+rna <- AddMetaData(rna, metadata = data.frame(metadata, row.names = metadata$sample))
+```
+
+Lets first have a look into the number of cells per stage and lineage:
+```{r}
+#Cells per stage
+table(rna@meta.data$stage)
+table(rna@meta.data$stage, rna@meta.data$lineage10x_2)
+```
+### Filter samples 
+Lets keep only 50 samples per stage-lineage combination.
+
+```{r}
+rna_subset <- rna@meta.data %>%
+  dplyr::group_by(stage, lineage10x_2) %>%
+  dplyr::slice_sample(n = 50, replace = FALSE) %>%  # sample up to 50 cells per group
+  dplyr::ungroup()
+
+# Keep only those cells in the Seurat object
+rna_sub <- subset(rna, cells = rna_subset$sample)
+```
+
+
+### Filter variable features
+
+Such as before, keep only the most variable features.
+```{r}
+rna_sub <- FindVariableFeatures(rna_sub, nfeatures = 1000)
+
+#Keep only variable genes
+var_genes <- VariableFeatures(rna_sub)
+```
+
+## Create long dataframe for input in MEFISTO
+
+```{r}
+# Get expression values
+expr_mat <- as.data.frame(GetAssayData(rna_sub, slot = "data"))[var_genes,]
+
+# Create long data frame for input in mofa
+long_df <- expr_mat %>%
+  tibble::rownames_to_column(var = "feature") %>%
+  pivot_longer(
+    cols = -feature,
+    names_to = "sample",
+    values_to = "value"
+  )
+
+#Create covariate matrix with different stages
+cov_matrix <- t(as.matrix(
+  setNames(
+    as.numeric(factor(rna_sub@meta.data$stage, levels = sort(unique(rna_sub@meta.data$stage)))),
+    rownames(rna_sub@meta.data)
+  )
+))
+rownames(cov_matrix) <- "stage_numeric"
+```
+
+
+## Create MEFISTO object
+```{r}
+# Create Mefisto object
+MEFISTOobject <- create_mofa(
+  data = long_df
+)
+
+# Set covariates
+MEFISTOobject <- set_covariates(MEFISTOobject, covariates = cov_matrix)
+
+#MEFISTOobject@covariates
+```
+
+
+### MEFISTO options
+
+Importantly, to activate the use of the covariate for a functional decomposition 
+(MEFISTO) we now additionally to the standard MOFA options need to specify 
+mefisto_options. For this you can just use the default options (get_default_mefisto_options). 
+Also, mefisto might take longer to run, so lets decrease the number of iterations.
+
+
+```{r}
+# Define options
+model_opts <- get_default_model_options(MEFISTOobject)
+model_opts$num_factors <- 5
+
+train_opts <- get_default_training_options(MEFISTOobject)
+train_opts$maxiter <- 100
+
+mefisto_opts <- get_default_mefisto_options(MEFISTOobject)
+
+MEFISTOobject <- prepare_mofa(MEFISTOobject, model_options = model_opts,
+                   mefisto_options = mefisto_opts,
+                   training_options = train_opts)
+```
+
+
+## Run MEFISTO
+This step can take some minutes... 
+(If it takes too long (>5 min), then its better to reduce the number of samples,
+or load the pre-computed model).
+
+```{r}
+MEFISTOobject <- run_mofa(MEFISTOobject,
+                          use_basilisk = TRUE
+                          )
+```
+
+
+## Downstream Analysis
+
+### Add lineage info to samples metadata
+
+```{r}
+# Add metadata info (e.g lineage)
+MEFISTOobject@samples_metadata <- MEFISTOobject@samples_metadata %>%
+  left_join(
+    rna_sub@meta.data %>%
+      select(lineage10x_2, sample),
+    by="sample") %>%
+  dplyr::rename(lineage=lineage10x_2.x)
+```
+
+
+### Load pre-computed MOFA model (OPTIONAL)
+
+**In case you were not able to train the model, you can also load a pre-computed one.**
+
+```{r}
+MEFISTOobject <- readRDS(file.path(data_dir, "MEFISTOmodel.rds"))
+```
+
+
+### Variance Explained 
+
+Using plot_variance_explained we can explore which factor is active in which view. plot_factor_cor shows us whether the factors are correlated.
+
+```{r}
+#variance
+plot_variance_explained(MEFISTOobject)
+
+#correlation
+plot_factor_cor(MEFISTOobject)
+```
+All factor capture variance explained (could be interesting to repeat the training 
+with more factors). Factor 1 and 3 show to be correlated. 
+
+### Smoothness
+
+The model learns scale parameters of the Gaussian Process (GP) priors over factors 
+— these define how smoothly or strongly correlated each factor varies along your covariate(s). 
+For each factor, we get an indication of the smoothness along the covariate between 0 and 1. 
+A scale of 0 means that the factor does not depend on the covariate, a value close 
+to 1 tells us that this factor varies very smoothly along the covariate.
+
+
+```{r}
+get_scales(MEFISTOobject)
+```
+
+
+Plot the smothness coefficient for each Factor.
+
+```{r}
+plot_smoothness(MEFISTOobject)
+```
+
+Factor 1 and Factor 3 show some dependency on the stage, meaning they capture 
+gradual trends along developmental progression.
+Factors 2, 4 and 5 have scales = 0, meaning they do not vary with stage — they might capture 
+effects on other variables such as batch effects, lineage-specific variation, etc.).
+
+## Plot factors
+
+```{r}
+plot_factors_vs_cov(MEFISTOobject, color_by = "stage_numeric")
+```
+
+
+
+```{r}
+plot_factor(MEFISTOobject,
+  factor = 1,
+  color_by = "lineage", 
+  add_violin = TRUE,
+  dodge = TRUE
+) 
+
+plot_factor(MEFISTOobject,
+  factor = 1,
+  color_by = "stage_numeric", 
+  add_violin = TRUE,
+  dodge = TRUE
+) 
+
+#other factor - non-smooth
+plot_factor(MEFISTOobject,
+  factor = 3,
+  color_by = "lineage", 
+  add_violin = TRUE,
+  dodge = TRUE
+) 
+
+
+```
+```{r}
+MEFISTOobject@samples_metadata
+```
+
+
+```{r}
+plot_factors(MEFISTOobject,
+  factor = c(1,3),
+  color_by = "lineage"
+) 
+
+plot_factors(MEFISTOobject,
+  factor = c(1,3),
+  color_by = "stage_numeric"
+) 
+```
+
+
+In addition, we can take a look at the top feature values per factor along the stages.
+
+```{r}
+plot_data_vs_cov(MEFISTOobject, factor=1,
+                         features = 6,
+                         color_by = "stage_numeric",
+                         dot_size = 1)
+```
+
+As with standard MOFA, we can now look deeper into the meaning of these factors by exploring the weights or performing feature set enrichment analysis.
+
+```{r}
+plot_top_weights(MEFISTOobject, factors = 1)
+```
+
+# Optional part: GSEA on the weights
+
+This part can be applied to any of the 3 parts of this tutorial: Sometimes factors cannot be easily characterised by simply inspecting the genes with the largest weight in each factor. Sometimes it is useful to combine information across genes and work instead with gene sets (i.e. biological pathways).
+
+Here we applied GSEA on the RNA weights.
+
+## Load GSEA annotation
+
+There are a large number of gene set annotations, and the right one to use will 
+depend on your data set. Some generic and commonly used ones are MSigDB, Reactome and Gene Ontology.
+
+In MOFAdata package, there are some processed gene sets, that we can use.
+
+```{r}
+library(MOFAdata)
+data("MSigDB_v6.0_C5_mouse") 
+```
+
+```{r}
+library(biomaRt)
+
+# Connect to Ensembl
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+
+# Get mapping
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "mgi_symbol"),
+  mart = mart
+)
+
+features_names(MEFISTOobject)[["single_view"]] <- features_mapped <- toupper(gene_map$mgi_symbol[match(features_names(MEFISTOobject)[["single_view"]], gene_map$ensembl_gene_id)])
+  
+```
+
+
+```{r}
+enrichment.out <- run_enrichment(
+  object = MEFISTOobject, 
+  view = "single_view",
+  feature.sets = MSigDB_v6.0_C5_mouse,
+  statistical.test = "parametric",
+  alpha = 0.01
+)
+```
+
+
+Plot a heatmap of gene sets (rows) versus factors (columns) where each entry correspons to the log p-value. This is useful to get an overview on which factors show statistically enriched pathways.
+
+```{r}
+plot_enrichment_heatmap(enrichment.out)
+```
+
+
+```{r}
+plot_enrichment(enrichment.out, 
+  factor = 1, 
+  max.pathways = 10
+)
+
+plot_enrichment(enrichment.out, 
+  factor = 3, 
+  max.pathways = 10
+)
+```
+
+
+# sessionInfo
+
+```{r}
+sessionInfo()
+```
+
+# Contributors
+
+Project material is based on material by Britta Velten, Ricard
+Argelaguet and Max Frank.
