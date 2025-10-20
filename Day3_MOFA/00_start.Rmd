@@ -1,0 +1,70 @@
+---
+title: Quick start with necessary packages
+author: "Francisca vieira"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+The purpose of this file is to verify that you have successfully installed R and RStudio and necessary packages for the workshop.
+
+## Checking your R version
+This chunk will produce an error if your R version is not up-to-date. In this case, you can update it by installing the latest version from this [LINK](https://cran.r-project.org/). After the installation you need to re-open RStudio and re-run this file to check whether you now have the latest version.
+```{r}
+if(version$major < 4 | version$minor < 4) {
+  stop("Your R version is not up-to-date. Please download the latest R version (4.4)")
+} else {
+  print("Your R version is up-to-date.")
+  }
+```
+
+
+# Using Bioconductor
+In this course we will make use of packages that are installed from Bioconductor. 
+
+[Bioconductor](https://www.bioconductor.org/about/) is a platform for R packages tailored to applications in the life sciences. The mission of the Bioconductor project is to develop, support, and disseminate free open source software for rigorous and reproducible analysis of biological data.
+
+To install packages from Bioconductor there is a dedicated package manager called `BiocManager` that will take care of installing and managing different versions of packages. In case, you don't have it yet installed:
+```{r}
+install.packages("BiocManager")
+```
+
+For details on installing Bioconductor refer to [their documentation](https://www.bioconductor.org/install/).
+
+
+## Installing packages from Bioconductor
+
+```{r}
+BiocManager::install("MOFA2")
+BiocManager::install("MOFAdata")
+BiocManager::install("biomaRt")
+```
+
+## Installing other packages required for the course
+In the following we will install specific packages needed for the course. 
+
+```{r, eval = FALSE}
+# if not installed yet, install the packages like this
+
+# Install packages
+install.packages(c(
+  "data.table", "Seurat", "ggplot2", "dplyr", "tidyr", "tibble", "reticulate",
+  "devtools")
+  )
+```
+
+Now check if all packages can be loaded.
+
+```{r, eval = FALSE}
+
+library(MOFA2)
+library(MOFAdata)
+library(biomaRt)
+
+library(ggplot2)
+library(dplyr)
+library(Seurat)
+library(data.table)
+library(tibble)
+library(tidyr)
+```
