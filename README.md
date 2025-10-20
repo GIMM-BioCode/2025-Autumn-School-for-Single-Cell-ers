@@ -19,6 +19,7 @@ In the morning, you’ll explore MUSCAT, a powerful tool for multi-sample differ
 ## Day 3 - MOFA
 **_Instructor:_** Francisca Gaspar Vieira, Heidelberg University & EMBL-EBI \
 This session will focus on MOFA, a statistical framework designed for the integration of multiple data modalities and groups of samples. You’ll learn how to apply MOFA to uncover shared and unique biological signals across datasets.
+
 The data for the practical tutorial is available in the following link: https://heibox.uni-heidelberg.de/d/ceaf2baade004a1f8af3/
 
 ## Day 4 -  Cell-cell communication
