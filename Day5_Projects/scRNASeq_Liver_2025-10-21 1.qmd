@@ -1,0 +1,863 @@
+---
+title: "scRNASeq_Liver"
+author: "André Barros & Helena Cabaço"
+date: last-modified
+execute:
+    echo: true
+    warning: false
+editor: visual
+format:
+  html:
+    toc: true
+    standalone: true
+    embed-resources: true
+    code-fold: true
+    code-tools: true
+---
+
+```{r setup, include=F}
+knitr::opts_chunk$set(root.dir = "C:/Users/asbarros/OneDrive - FUNDAÇÃO GIMM - GULBENKIAN INSTITUTE FOR MOLECULAR MEDICINE/ADA/ZZ_Tutorials/AutumSchool_scRNASeq/Group_Project/")
+
+library(Seurat)
+library(tidyverse)
+library(sctransform)
+library(crayon)
+
+library(igraph) # for networks
+library(pheatmap) # for simple heatmaps
+
+library(presto) # fast DE
+library(gprofiler2) # gene set enrichment
+
+library(liana) # cell-cell communication
+
+```
+
+# scRNASeq Analysis Liver - Steady State vs NAFLD
+
+This notebook is focused on the analysis of a scRNASeq dataset of liver, comparing samples from controls (steady state) and NAFLD.
+
+```{r import}
+setwd("C:/Users/asbarros/OneDrive - FUNDAÇÃO GIMM - GULBENKIAN INSTITUTE FOR MOLECULAR MEDICINE/ADA/ZZ_Tutorials/AutumSchool_scRNASeq/Group_Project/")
+
+sce = readRDS("00_Dataset/MouseLiverNAFLD.RDS")
+sce
+
+orig_metadata = read.table("01_OriginalMetadata/GSE166504_cell_metadata.20220204.tsv",sep="\t",header=T) %>%
+  mutate(UniqueID = paste0(FileName,"_",CellID))
+
+sce@meta.data = sce@meta.data %>%
+              mutate(UniqueID = paste0(FileName,"_",CellID))
+
+orig_metadata = orig_metadata %>% 
+  filter(UniqueID %in% sce@meta.data$UniqueID)
+
+
+#all(orig_metadata$UniqueID == sce@meta.data$UniqueID)
+
+sce@meta.data$celltype = orig_metadata$CellType
+
+
+metadata = sce@meta.data
+
+table(metadata$animal,metadata$sort,metadata$time)
+table(metadata$capture,metadata$sort,metadata$time)
+
+cat(paste0(bold("\nTotal Number of Genes with >0 counts: "), sum(rowSums(sce@assays$RNA) > 0)," (", 
+           round(100*sum(rowSums(sce@assays$RNA) > 0) / nrow(sce@assays$RNA),2),"% of full dataset)")) 
+
+```
+
+The dataset contains \~31k cells, with \~25k features (genes) - out of those, only ~18k (72%) of the genes have counts.
+
+We have hepatocytes & non-parenchimal cells (NPCs), distributed into three groups: Chow (negative control), 15 weeks post-treatment and 30 weeks post-treatment. We have replicates (2-3) per timepoint, per cell type. The capture of the samples was also performed in two separated captures (Capture1 and Capture2).
+
+**Note:** What is the age of the 'Chow' group? In reality, there are changes that happen to the liver throughout age; therefore, the control here is not optimal.
+
+To simplify our work, we are going to keep only the samples *from 30 weeks and from Chow (Negative Control)*:
+
+```{r}
+
+sce@meta.data$Filt = ifelse(sce@meta.data$time=="15weeks",F,T)
+
+sce_30vCh = subset(sce, subset=Filt)
+
+sce = sce_30vCh
+
+sce_30vCh
+#################
+
+metadata = sce@meta.data
+
+table(metadata$animal,metadata$sort,metadata$time)
+table(metadata$capture,metadata$sort,metadata$time)
+
+cat(paste0(bold("\nTotal Number of Genes with >0 counts: "), sum(rowSums(sce@assays$RNA) > 0)," (", 
+           round(100*sum(rowSums(sce@assays$RNA) > 0) / nrow(sce@assays$RNA),2),"% of full dataset)")) 
+```
+
+We are now working with ~19K cells, now with ~17.5k features (~70%) with genes with >0 counts. 
+
+## Quality Control
+
+```{r QC1, fig.height=6,fig.width=8}
+# Establish the default assay
+DefaultAssay(sce) <- 'RNA'
+
+# Add column for the percentage of reads associated with mitochondrial genes - Not found in our dataset
+
+#sce = PercentageFeatureSet(sce, col.name = "percent.mt", assay = "RNA", pattern = "^mt-") 
+
+# Check the plot for features, counts & percentage of mitochondrial genes
+VlnPlot(sce, features = c("nFeature_RNA", "nCount_RNA"), ncol = 2,log=T)
+VlnPlot(sce, features = c("nFeature_RNA", "nCount_RNA"), ncol = 2,log=T,pt.size = 0)
+
+```
+
+We could not find any mitochondrial genes in the dataset (based on the `^mt-` classification). The expectation is that these genes were filtered out before the raw data was deposited online.
+
+These violin plots are more informative in log scale (especially for the lower cutoffs). Looking at the `nCount_RNA`, we can also observe that there was already some pre-filtering performed in this dataset. For this, we also observe less sequencing depth in NPC's compared with hepatocytes, which is a good indication that cut-offs should be performed per sorted cell type.
+
+We have two batch variables, 'Animal' and 'Capture'. Considering the pre-processing should be done on a *per sample* level (if not in multiplex), let us check if these variables have any influence in the filtering, we should perform violin plots according with these variables:
+
+```{r QC2, fig.height=10,fig.width=8}
+f1 = VlnPlot(sce, features = c("nFeature_RNA"), log=T,group.by = "sort",split.by = "animal",pt.size = 0.5)+scale_fill_hue()+
+  theme_bw()+
+  theme(plot.title=element_text(hjust = 0.5))
+
+f2 = VlnPlot(sce, features = c("nCount_RNA"), log=T,group.by = "sort",split.by = "animal",pt.size=0.5)+scale_fill_hue()+
+  theme_bw()+
+  theme(plot.title=element_text(hjust = 0.5))
+
+f1 + f2
+
+#####################################################################################################################
+
+f3 = VlnPlot(sce, features = c("nFeature_RNA"), log=T,group.by = "sort",split.by = "capture")+scale_fill_hue()+
+  theme_bw()+
+  theme(plot.title=element_text(hjust = 0.5))
+
+f4 = VlnPlot(sce, features = c("nCount_RNA"), log=T,group.by = "sort",split.by = "capture")+scale_fill_hue()+
+  theme_bw()+
+  theme(plot.title=element_text(hjust = 0.5))
+
+f3 + f4
+
+```
+
+For the 'Capture' variable, a customized approach *per capture* is not necessary; on the other hand, there seems to exist a pattern per 'Animal' in our dataset (in fact, we can observe already some performed filtering). Specifically for `nFeature_RNA` in hepatocytes, we can perform a more hard filtering:
+
+-   For Animal 1, hepatocytes can be filtered at 650 features;
+-   For Animal 2, the filtering is good,
+-   For Animal 3, hepatocytes can be filtered at 650 features;
+
+```{r QC3 & filt, fig.height=6,fig.width=8}
+
+metadata= metadata %>%
+  mutate(QC_filt = case_when(
+    sort=="NPC" ~ TRUE,
+    sort=="Hepatocyte" & animal=="Animal1" & nFeature_RNA>650 ~ TRUE,
+    sort=="Hepatocyte" & animal=="Animal2" ~ TRUE,
+    sort=="Hepatocyte" & animal=="Animal3" & nFeature_RNA>650 ~ TRUE,
+    TRUE ~ FALSE
+  ))
+
+sce$QC_filt1 = metadata$QC_filt
+
+VlnPlot(sce, features = c("nFeature_RNA"), log=T,group.by = "sort",split.by = "QC_filt1")+scale_fill_hue()+
+  theme_bw()+
+  theme(plot.title=element_text(hjust = 0.5))
+
+
+sce_qcfilt = subset(sce, subset=QC_filt1)
+
+
+
+cat(paste0(bold("\nNumber of cells kept: "), ncol(sce_qcfilt@assays$RNA)," (", 
+           ncol(sce@assays$RNA) - ncol(sce_qcfilt@assays$RNA)," cells excluded)"))
+```
+
+In total, we only discarded additional **63** cells - a small number like this was expected, considered the dataset had been previously filtered.
+
+### Normalization
+
+In the normalization step, we are going to perform `sctransform`. As stated in the paper, it is possible to use this function to account for batch effects - in our case, 'animal' and 'capture'; however, this approach is not fully consensusal - There is some discussing on how useful is this (https://github.com/satijalab/seurat/issues/7866) and if we should do this normalization step *per sample*.
+
+#### `sctransform` on full dataset
+
+According with `sctransform` paper, we have to perform two rounds of normalization - first, to account for library size, and only afterwards the batch effect.
+
+```{r norm}
+cat("\nRunning the first normalization step - with just per-sample metrics\n")
+sce_norm1 = SCTransform(sce_qcfilt, verbose = F,
+                        vars.to.regress = c("nFeature_RNA", "nCount_RNA"),  
+                        variable.features.n = 5000,
+                        seed.use = 123)
+
+DefaultAssay(sce_norm1) = "SCT"
+
+cat("\nRunning the second normalization step - with per-sample metrics and batch effect\n")
+sce_norm2 = SCTransform(sce_norm1, verbose = F,
+                        vars.to.regress = c("nFeature_RNA", "nCount_RNA","animal","capture"),  
+                        variable.features.n = 5000,
+                        seed.use = 123)
+
+```
+
+## Dimensionality Reduction
+
+### Principal Component Analysis (PCA)
+
+First step is to determine the number of principal components (PCs) that should be included for UMAPs
+
+```{r PCA1}
+
+sce_pca = RunPCA(sce_norm2, verbose = T, assay = "SCT", npcs = 50)
+
+#DimPlot(sce_pca, reduction = "pca", dims = 1:2)
+
+ElbowPlot(sce_pca, ndims = 50)
+
+```
+Probably, we are safe to use only 30 PC's for the UMAP.
+
+```{r,fig.width=12,fig.height=6}
+
+PCA_df = sce_pca@reductions$pca@cell.embeddings %>% 
+  as.data.frame() %>% mutate(UniqueID = rownames(.))
+
+res_PCA = data.frame(PC=NA,sort=NA,cond=NA,r2=NA)
+
+for (i in 1:30){
+  
+  tb = data.frame(sce_pca@meta.data, PC = PCA_df[,i]) %>%
+    mutate(batch=paste0(animal,"_",capture))
+  
+  tb_list = split(tb,tb$sort)
+  
+  m1_hep = lm(PC ~ animal,data=tb_list$Hepatocyte)
+  m2_hep = lm(PC ~ capture,data=tb_list$Hepatocyte)
+  m3_hep = lm(PC ~ batch,data=tb_list$Hepatocyte)
+  m4_hep = lm(PC ~ celltype,data=tb_list$Hepatocyte)
+  
+  m1_NPC = lm(PC ~ animal,data=tb_list$NPC)
+  m2_NPC = lm(PC ~ capture,data=tb_list$NPC)
+  m3_NPC = lm(PC ~ batch,data=tb_list$NPC)
+  m4_NPC = lm(PC ~ celltype,data=tb_list$NPC)
+
+  temp = data.frame(PC=i,
+                    sort=rep(c("Hepatocytes","NPC"),each=4),
+                    cond=rep(c("Animal","Capture","Batch","CellType"),times=2),
+                    r2 = c(performance::r2(m1_hep)$R2_adjusted,performance::r2(m2_hep)$R2_adjusted,performance::r2(m3_hep)$R2_adjusted,
+                           performance::r2(m4_hep)$R2_adjusted,
+                           performance::r2(m1_NPC)$R2_adjusted,performance::r2(m2_NPC)$R2_adjusted,performance::r2(m3_NPC)$R2_adjusted,
+                           performance::r2(m4_NPC)$R2_adjusted))
+  res_PCA = rbind(res_PCA,temp)
+  
+}
+
+res_PCA %>%
+  filter(!is.na(PC)) %>%
+  ggplot(.,aes(x=PC,y=r2,color=cond))+
+    geom_point(size=2,alpha=.7)+
+    geom_line(aes(group=cond),linewidth=1)+
+    facet_wrap(~sort,nrow=1)+
+    theme_bw()+
+    ylim(min(res_PCA$PC),1)+
+    theme(axis.title.x=element_blank(),axis.text = element_text(size=12),
+        plot.title = element_text(hjust=0.5),strip.background=element_rect(fill="black"),
+        strip.text = element_text(color="white",size=16),
+        legend.position = "bottom",text = element_text(size=16),legend.title=element_blank(),axis.text.y=element_text(size=14))
+```
+Looking at the results:
+- The biggest R2 values are definitely for the CellType, which makes sense. Interestingly, this variable seems to be more relevant for NPCs;
+- There are some effects in early PC's with some relevant R2 for animal (in hepatocytes) and for Capture (in NPCs)
+
+This could be an indications we should perform some kind of batch correction (via integration).
+
+### UMAP
+
+```{r,fig.width=12,fig.height=6}
+
+sce_umap <- RunUMAP(sce_pca, dims = 1:30, verbose = F)
+
+sce_umap@meta.data = 
+    sce_umap@meta.data %>%
+        mutate(batch=paste0(animal,"_",capture))
+
+
+DimPlot(sce_umap, reduction = "umap",group.by = "animal",split.by = "time")
+DimPlot(sce_umap, reduction = "umap",group.by = "capture",split.by = "time")
+DimPlot(sce_umap, reduction = "umap",group.by = "batch",split.by = "time")
+DimPlot(sce_umap, reduction = "umap",group.by = "celltype",split.by = "time")
+
+```
+
+The UMAPs produced showed us:
+- Cell types seem pretty well defined, as expected;
+- There are some rotations & clusters that seem associated with capture (mostly for hepatocytes and endothelial cells). This is an indication that we should perform some integration & batch correction in our dataset, taking 'capture' into consideration.
+
+For the sake of time, we are going to filter our dataset only for 'Capture1'.
+
+## Filtering for 'Capture1'
+
+```{r}
+
+sce_filt = subset(sce_qcfilt,subset=capture=="Capture1")
+
+sce = sce_filt
+
+sce_filt
+#################
+
+metadata = sce@meta.data
+
+table(metadata$animal,metadata$sort,metadata$time)
+table(metadata$capture,metadata$sort,metadata$time)
+
+cat(paste0(bold("\nTotal Number of Genes with >0 counts: "), sum(rowSums(sce@assays$RNA) > 0)," (", 
+           round(100*sum(rowSums(sce@assays$RNA) > 0) / nrow(sce@assays$RNA),2),"% of full dataset)")) 
+
+```
+We get only ~11k samples now, with ~17K genes with >0 counts (~68% of the dataset).
+
+```{r}
+
+sce_norm = SCTransform(sce, verbose = F,
+                        vars.to.regress = c("nFeature_RNA", "nCount_RNA"),  
+                        variable.features.n = 5000,
+                        seed.use = 123)
+
+saveRDS(sce_norm,"Capt_norm_sce.RDS")
+
+rm(list=ls())
+
+sce = readRDS("Capt_norm_sce.RDS")
+
+```
+
+## Dimensionality Reduction - Only Capture1
+
+### Principal Component Analysis (PCA)
+
+First step is to determine the number of principal components (PCs) that should be included for UMAPs
+
+```{r norm_sep_2}
+
+sce_pca = RunPCA(sce, verbose = T, assay = "SCT", npcs = 50)
+
+#DimPlot(sce_pca, reduction = "pca", dims = 1:2)
+
+ElbowPlot(sce_pca, ndims = 50)
+```
+We are keeping the number of PC's at 40 - to be a bit more permissive.
+
+### UMAP
+
+```{r,fig.width=12,fig.height=6}
+
+sce_umap <- RunUMAP(sce_pca, dims = 1:40, verbose = F)
+
+sce_umap@meta.data = 
+    sce_umap@meta.data %>%
+        mutate(batch=paste0(animal,"_",capture))
+
+
+DimPlot(sce_umap, reduction = "umap",group.by = "animal",split.by = "time")
+DimPlot(sce_umap, reduction = "umap",group.by = "celltype",split.by = "time")
+
+```
+
+Although the integration is not perfect, we consider it is safe to proceed with the analysis.
+
+We are going to check the UMAP, divided by cell type:
+
+```{r, fig.width=16,fig.height=10}
+DimPlot(sce_umap, reduction = "umap",group.by = "time",split.by = "celltype",ncol = 4)
+```
+
+## Downstream Analysis
+
+### Gene Set Enrichment Analysis
+
+```{r}
+table(sce$time,sce$celltype)
+```
+
+From the data here, we see that the number of cells is considerably reduced in several conditions. For those which have =<5 in one of the groups, we will not considered it. 
+
+
+```{r}
+
+Idents(sce) = sce$time
+
+cells_df = table(sce$time,sce$celltype) %>% as.data.frame() %>% group_by(Var2) %>% summarise(keep=all(Freq>5))
+
+comp_l = cells_df$Var2[cells_df$keep==T]
+
+de_cond_l = list()
+
+for(n in comp_l){
+  
+  cat(paste0("\nTaking care of: ",n," - diff. analysis\n"))
+    cells = sce$celltype %in% n
+    print(table(sce[,cells]$celltype, sce[,cells]$time))
+    
+    de_cond_l[[n]] = FindMarkers(sce[,cells], ident.1 = "30weeks", ident.2 = "Chow")
+}
+
+```
+
+
+```{r}
+allgenes = rownames(sce) # all genes, to serve as background
+
+res_GSEA = data.frame(comp=NA,term_name=NA,intersection_size=NA,p_value=NA)
+
+for (n in names(de_cond_l)) {
+  
+    cat(paste0("\nTaking care of: ",n," - GSEA\n"))
+  
+  mk_clusters = de_cond_l[[n]]
+
+  degenes = mk_clusters %>%
+    arrange(-avg_log2FC) 
+  
+  cat(paste0("\n -> Up-regulated"))
+
+  gprof_up = gost(rownames(degenes), ordered_query = T, 
+                custom_bg = allgenes, # always set a custom bg!
+                sources = "GO:BP", 
+                correction_method = "g_SCS", # more stringent than FDR, 
+                organism = "mmusculus", user_threshold = 0.05)
+  
+  degenes = mk_clusters %>%
+    arrange(avg_log2FC) 
+  
+  cat(paste0("\n -> Down-regulated"))
+  
+  gprof_down = gost(rownames(degenes), ordered_query = T, 
+                custom_bg = allgenes, # always set a custom bg!
+                sources = "GO:BP", 
+                correction_method = "g_SCS", # more stringent than FDR, 
+                organism = "mmusculus", user_threshold = 0.05)
+  
+  temp = gprof_up$result %>%
+    rbind(gprof_down$result %>% mutate(intersection_size=-intersection_size)) %>%
+    filter(p_value<0.01) %>%
+    top_n(n = 10,wt=-log10(p_value)) %>%
+    mutate(comp=n) %>%
+    select(comp,term_name,intersection_size,p_value)
+    
+  
+res_GSEA = rbind(res_GSEA,temp)
+}
+
+```
+
+```{r,fig.width=15,fig.height=22}
+res_GSEA %>% 
+  mutate(signal=ifelse(intersection_size<0,"down","up")) %>%
+  filter(!is.na(comp)) %>%
+  ggplot(aes(x=-log10(p_value),y=term_name,color=signal))+
+    geom_segment(aes(x = 0, xend =-log10(p_value), y = term_name,yend=term_name), 
+                 color = "black")+
+    geom_point(size = 4)+
+    scale_colour_manual(values = c("down"="darkblue","up"="darkred"))+
+    facet_wrap(~comp,ncol=2,scales="free_y")+
+    scale_y_discrete(labels = scales::label_wrap(20)) +
+    theme_bw()+
+    labs(title = "GO:BP Enrichment Analysis")+
+    xlab("-log10(p-value)")+
+    ylab("GO Terms (BP)")+
+    theme(strip.background=element_rect(fill="black"),
+          strip.text = element_text(color="white",size=12),
+          plot.title = element_text(size=16,hjust=0.5,face="bold"),
+          plot.subtitle = element_text(size=12,hjust=0.5,face="italic"),
+          legend.position="bottom")
+```
+
+### Cell-Cell Communication
+
+```{r}
+srat_n = sce[,sce$time=="Chow"]
+srat_t = sce[,sce$time=="30weeks"]
+
+cat(paste0("\nProcessing Chow cells\n"))
+
+cell_tab = table(srat_n$celltype)
+cells_keep = colnames(srat_n)[srat_n$celltype %in% names(cell_tab)[cell_tab>=10]]
+srat_n = srat_n[,cells_keep]
+print(sort(unique(srat_n$celltype)))
+
+cat(paste0("\nProcessing 30weeks cells\n"))
+
+cell_tab = table(srat_t$celltype)
+cells_keep = colnames(srat_t)[srat_t$celltype %in% names(cell_tab)[cell_tab>=10]]
+srat_t = srat_t[,cells_keep]
+print(sort(unique(srat_t$celltype)))
+
+cat(bold(paste0("\nDifferences between cell types in conditions\n")))
+cat(paste0("\n-> Only for Chow: ",unique(srat_n$celltype)[!unique(srat_n$celltype) %in% srat_t$celltype]))
+cat(paste0("\n-> Only for 30weeks: ", as.character(paste0(unique(srat_t$celltype)[!unique(srat_t$celltype) %in% srat_n$celltype],collapse=", "))))
+
+```
+
+We have cells that are specific for each time-point/condition. To make the comparisons more comparable, let's exclude the cell types not overlapping.
+
+```{r}
+overlap = intersect(unique(srat_n$celltype),unique(srat_t$celltype))
+
+cat(paste0("\nProcessing Chow cells\n"))
+cells_keep = colnames(srat_n)[srat_n$celltype %in% overlap]
+srat_n = srat_n[,cells_keep]
+print(sort(unique(srat_n$celltype)))
+
+cat(paste0("\nProcessing 30weeks cells\n"))
+cell_tab = table(srat_t$celltype)
+cells_keep = colnames(srat_t)[srat_t$celltype %in% overlap]
+srat_t = srat_t[,cells_keep]
+print(sort(unique(srat_t$celltype)))
+
+```
+
+Now, we will proceed to LIANA
+
+```{r}
+liana_n = liana_wrap(srat_n, idents_col = "celltype", 
+                     method = "cellphonedb", resource = c("MouseConsensus"),
+                     permutation.params = list(nperms=500, parallelize=F, workers=4)) # you may need to adjust these depending on your computer
+liana_t = liana_wrap(srat_t, idents_col = "celltype", 
+                     method = "cellphonedb", resource = c("MouseConsensus"),
+                     permutation.params = list(nperms=500, parallelize=F, workers=4)) # you may need to adjust these depending on your computer
+```
+
+**Normal Conditions (Chow)**
+
+```{r,fig.width=8,fig.height=6}
+liana_n_filt = liana_n[liana_n$pvalue<=0.01,]
+liana_t_filt = liana_t[liana_t$pvalue<=0.01,]
+
+q20lr = quantile(c(liana_n_filt$lr.mean, liana_t_filt$lr.mean), 0.20)
+liana_n_filt = liana_n_filt[liana_n_filt$lr.mean>q20lr,]
+liana_t_filt = liana_t_filt[liana_t_filt$lr.mean>q20lr,]
+
+liana_n_filt_wrapped <- liana_n_filt %>%
+  mutate(
+    source = str_wrap(source, width = 20),
+    target = str_wrap(target, width = 20)
+  )
+
+
+heat_freq(liana_n_filt_wrapped, grid_text=T, font_size = 10)
+```
+
+**30 weeks**
+
+```{r,fig.width=8,fig.height=6}
+
+#################################################################
+
+liana_t_filt_wrapped <- liana_t_filt %>%
+  mutate(
+    source = str_wrap(source, width = 20),
+    target = str_wrap(target, width = 20)
+  )
+
+
+heat_freq(liana_t_filt_wrapped, grid_text=T, font_size = 10)
+```
+
+
+```{r,fig.width=12,fig.height=8}
+liana_n_filt %>%
+  group_by(source,ligand) %>%
+  summarise(Freq=n()) %>%
+  top_n(n = 10,Freq) %>%
+  ggplot(aes(x=Freq,y=ligand))+
+    geom_segment(aes(x = 0, xend =Freq, y = ligand,yend=ligand), 
+                 color = "black")+
+    geom_point(size = 4,color="darkblue")+
+    facet_wrap(~source,scales="free_y")+
+    theme_bw()+
+    labs(title = "Top Ligands per Cell Type",subtitle = "Normal Conditions")+
+    xlab("Freq.")+
+    ylab("Ligands")+
+    theme(strip.background=element_rect(fill="black"),
+          strip.text = element_text(color="white",size=12),
+          plot.title = element_text(size=16,hjust=0.5,face="bold"),
+          plot.subtitle = element_text(size=12,hjust=0.5,face="italic"),
+          legend.position="bottom")
+
+
+liana_n_filt %>%
+  group_by(target,receptor) %>%
+  summarise(Freq=n()) %>%
+  top_n(n = 10,Freq) %>%
+  ggplot(aes(x=Freq,y=receptor))+
+    geom_segment(aes(x = 0, xend =Freq, y = receptor,yend=receptor), 
+                 color = "black")+
+    geom_point(size = 4,color="darkred")+
+    facet_wrap(~target,scales="free_y")+
+    theme_bw()+
+    labs(title = "Top Receptors per Cell Type",subtitle = "Normal Conditions")+
+    xlab("Freq.")+
+    ylab("Ligands")+
+    theme(strip.background=element_rect(fill="black"),
+          strip.text = element_text(color="white",size=12),
+          plot.title = element_text(size=16,hjust=0.5,face="bold"),
+          plot.subtitle = element_text(size=12,hjust=0.5,face="italic"),
+          legend.position="bottom")
+
+```
+
+
+```{r,fig.width=12,fig.height=8}
+liana_t_filt %>%
+  group_by(source,ligand) %>%
+  summarise(Freq=n()) %>%
+  top_n(n = 10,Freq) %>%
+  ggplot(aes(x=Freq,y=ligand))+
+    geom_segment(aes(x = 0, xend =Freq, y = ligand,yend=ligand), 
+                 color = "black")+
+    geom_point(size = 4,color="darkblue")+
+    facet_wrap(~source,scales="free_y")+
+    theme_bw()+
+    labs(title = "Top Ligands per Cell Type",subtitle = "30weeks")+
+    xlab("Freq.")+
+    ylab("Ligands")+
+    theme(strip.background=element_rect(fill="black"),
+          strip.text = element_text(color="white",size=12),
+          plot.title = element_text(size=16,hjust=0.5,face="bold"),
+          plot.subtitle = element_text(size=12,hjust=0.5,face="italic"),
+          legend.position="bottom")
+
+
+liana_t_filt %>%
+  group_by(target,receptor) %>%
+  summarise(Freq=n()) %>%
+  top_n(n = 10,Freq) %>%
+  ggplot(aes(x=Freq,y=receptor))+
+    geom_segment(aes(x = 0, xend =Freq, y = receptor,yend=receptor), 
+                 color = "black")+
+    geom_point(size = 4,color="darkred")+
+    facet_wrap(~target,scales="free_y")+
+    theme_bw()+
+    labs(title = "Top Receptors per Cell Type",subtitle = "30weeks")+
+    xlab("Freq.")+
+    ylab("Ligands")+
+    theme(strip.background=element_rect(fill="black"),
+          strip.text = element_text(color="white",size=12),
+          plot.title = element_text(size=16,hjust=0.5,face="bold"),
+          plot.subtitle = element_text(size=12,hjust=0.5,face="italic"),
+          legend.position="bottom")
+
+```
+
+**Overlap**
+
+```{r,fig.width=12,fig.height=8}
+
+liana_n_filt = liana_n_filt %>% mutate(Comb = paste0(source,"-",ligand," to ", target," - ",receptor))
+liana_t_filt = liana_t_filt %>% mutate(Comb = paste0(source,"-",ligand," to ", target," - ",receptor))
+
+cat(paste0("Nr. of common ligand pairs: ",length(liana_n_filt$Comb[liana_n_filt$Comb %in% liana_t_filt$Comb]),
+           " (",round(100*length(liana_n_filt$Comb[liana_n_filt$Comb %in% liana_t_filt$Comb])/nrow(liana_n_filt),2),"% of Normal Interactions, ",
+           round(100*length(liana_n_filt$Comb[liana_n_filt$Comb %in% liana_t_filt$Comb])/nrow(liana_n_filt),2),"% of 30Weeks Interactions)"))
+
+liana_n_filt %>%
+  filter(!Comb %in% liana_t_filt$Comb) %>%
+  group_by(source,ligand) %>%
+  summarise(Freq=n()) %>%
+  top_n(n = 5,Freq) %>%
+  ggplot(aes(x=Freq,y=ligand))+
+    geom_segment(aes(x = 0, xend =Freq, y = ligand,yend=ligand), 
+                 color = "black")+
+    geom_point(size = 4,color="darkblue")+
+    facet_wrap(~source,scales="free_y")+
+    theme_bw()+
+    labs(title = "Top Ligands per Cell Type",subtitle = "Exclusive for Normal Conditions")+
+    xlab("Freq.")+
+    ylab("Ligands")+
+    theme(strip.background=element_rect(fill="black"),
+          strip.text = element_text(color="white",size=12),
+          plot.title = element_text(size=16,hjust=0.5,face="bold"),
+          plot.subtitle = element_text(size=12,hjust=0.5,face="italic"),
+          legend.position="bottom")
+
+
+liana_n_filt %>%
+    filter(!Comb %in% liana_t_filt$Comb) %>%
+  group_by(target,receptor) %>%
+  summarise(Freq=n()) %>%
+  top_n(n = 5,Freq) %>%
+  ggplot(aes(x=Freq,y=receptor))+
+    geom_segment(aes(x = 0, xend =Freq, y = receptor,yend=receptor), 
+                 color = "black")+
+    geom_point(size = 4,color="darkred")+
+    facet_wrap(~target,scales="free_y")+
+    theme_bw()+
+    labs(title = "Top Receptors per Cell Type",subtitle = "Exclusive for Normal Conditions")+
+    xlab("Freq.")+
+    ylab("Ligands")+
+    theme(strip.background=element_rect(fill="black"),
+          strip.text = element_text(color="white",size=12),
+          plot.title = element_text(size=16,hjust=0.5,face="bold"),
+          plot.subtitle = element_text(size=12,hjust=0.5,face="italic"),
+          legend.position="bottom")
+
+####################################################################################################
+
+liana_t_filt %>%
+  filter(!Comb %in% liana_n_filt$Comb) %>%
+  group_by(source,ligand) %>%
+  summarise(Freq=n()) %>%
+  top_n(n = 5,Freq) %>%
+  ggplot(aes(x=Freq,y=ligand))+
+    geom_segment(aes(x = 0, xend =Freq, y = ligand,yend=ligand), 
+                 color = "black")+
+    geom_point(size = 4,color="darkblue")+
+    facet_wrap(~source,scales="free_y")+
+    theme_bw()+
+    labs(title = "Top Ligands per Cell Type",subtitle = "Exclusive for 30weeks")+
+    xlab("Freq.")+
+    ylab("Ligands")+
+    theme(strip.background=element_rect(fill="black"),
+          strip.text = element_text(color="white",size=12),
+          plot.title = element_text(size=16,hjust=0.5,face="bold"),
+          plot.subtitle = element_text(size=12,hjust=0.5,face="italic"),
+          legend.position="bottom")
+
+
+liana_t_filt %>%
+    filter(!Comb %in% liana_n_filt$Comb) %>%
+  group_by(target,receptor) %>%
+  summarise(Freq=n()) %>%
+  top_n(n = 5,Freq) %>%
+  ggplot(aes(x=Freq,y=receptor))+
+    geom_segment(aes(x = 0, xend =Freq, y = receptor,yend=receptor), 
+                 color = "black")+
+    geom_point(size = 4,color="darkred")+
+    facet_wrap(~target,scales="free_y")+
+    theme_bw()+
+    labs(title = "Top Receptors per Cell Type",subtitle = "Exclusive for 30weeks")+
+    xlab("Freq.")+
+    ylab("Ligands")+
+    theme(strip.background=element_rect(fill="black"),
+          strip.text = element_text(color="white",size=12),
+          plot.title = element_text(size=16,hjust=0.5,face="bold"),
+          plot.subtitle = element_text(size=12,hjust=0.5,face="italic"),
+          legend.position="bottom")
+
+```
+
+````{r,fig.width=6,fig.height=6}
+
+liana_n_excl = liana_n_filt %>%
+    filter(!Comb %in% liana_t_filt$Comb) %>%
+      mutate(source=case_when(
+        source=="Kupffer cells" ~ "KC",
+        source=="Monocyte/Monocyte derived macrophage" ~ "Mon",
+        source=="Endothelial cells" ~ "EC",
+        source=="DCs" ~ "DCs",
+        source=="B" ~ "B",
+        source=="Stellate cells" ~ "SCs",
+        source=="Hepatocytes" ~ "Hep",
+        source=="T"~ "T",
+        source=="Hepatic progenitor cells" ~ "HPCs",
+        TRUE ~ NA
+      ),target=case_when(
+        target=="Kupffer cells" ~ "KC",
+        target=="Monocyte/Monocyte derived macrophage" ~ "Mon",
+        target=="Endothelial cells" ~ "EC",
+        target=="DCs" ~ "DCs",
+        target=="B" ~ "B",
+        target=="Stellate cells" ~ "SCs",
+        target=="Hepatocytes" ~ "Hep",
+        target=="T"~ "T",
+        target=="Hepatic progenitor cells" ~ "HPCs",
+        TRUE ~ NA
+      ))
+      
+
+
+par(cex = 0.8)  # Reduce all text to 80% of default
+chord_freq(liana_n_excl)
+title("Normal Conditions", cex.main = 1.5)
+
+
+###################################################################################
+
+liana_t_excl = liana_t_filt %>%
+    filter(!Comb %in% liana_n_filt$Comb) %>%
+      mutate(source=case_when(
+        source=="Kupffer cells" ~ "KC",
+        source=="Monocyte/Monocyte derived macrophage" ~ "Mon",
+        source=="Endothelial cells" ~ "EC",
+        source=="DCs" ~ "DCs",
+        source=="B" ~ "B",
+        source=="Stellate cells" ~ "SCs",
+        source=="Hepatocytes" ~ "Hep",
+        source=="T"~ "T",
+        source=="Hepatic progenitor cells" ~ "HPCs",
+        TRUE ~ NA
+      ),target=case_when(
+        target=="Kupffer cells" ~ "KC",
+        target=="Monocyte/Monocyte derived macrophage" ~ "Mon",
+        target=="Endothelial cells" ~ "EC",
+        target=="DCs" ~ "DCs",
+        target=="B" ~ "B",
+        target=="Stellate cells" ~ "SCs",
+        target=="Hepatocytes" ~ "Hep",
+        target=="T"~ "T",
+        target=="Hepatic progenitor cells" ~ "HPCs",
+        TRUE ~ NA
+      ))
+      
+
+
+par(cex = 0.8)  # Reduce all text to 80% of default
+chord_freq(liana_t_excl)
+title("30weeks", cex.main = 1.5)
+
+````
+
+## An additional look - Olfactory Receptors
+
+```{r, fig.width=10,fig.height=8}
+
+sce <- PercentageFeatureSet(sce, pattern = "^Olfr", col.name = "pct_olfr",assay = "RNA")
+counts <- sce@assays$RNA$counts
+
+olfr_genes <- rownames(counts)[grepl("^Olfr", rownames(counts))]
+cat(paste0("\nNr. of Olfr Genes: ",length(olfr_genes),"\n"))
+
+VlnPlot(sce, features = c("pct_olfr"), group.by="celltype",split.by="time",sort = T)+
+  ggtitle("Percentage of Reads in Olfr Genes")+
+  theme(legend.position = "bottom") # these two metrics are also useful in log scale
+
+cat("\nNr. of Olfrs with expression per cell: \n")
+table(Matrix::rowSums(counts[olfr_genes, , drop = FALSE] > 0))
+
+sce$nFeature_Olfr <- Matrix::colSums(counts[olfr_genes, , drop = FALSE] > 0)
+
+VlnPlot(sce, features = c("nFeature_Olfr"),group.by="celltype",split.by="time",sort = T)+
+  ggtitle("Nr. of Olfr Genes w/ expression per cell")+
+  theme(legend.position = "bottom") # these two metrics are also useful in log scale
+
+rowSums(counts[olfr_genes, , drop = FALSE] > 0) [rowSums(counts[olfr_genes, , drop = FALSE] > 0)>0]
+
+```
+
+```{r,fig.width=10,fig.height=8}
+
+Olfr_interest = names(rowSums(counts[olfr_genes, , drop = FALSE] > 0) [rowSums(counts[olfr_genes, , drop = FALSE] > 0)>0])
+
+FeaturePlot(sce_umap, features = Olfr_interest)
+```
+
+
+#SessionInfo
+```{r}
+sessionInfo()
+```
